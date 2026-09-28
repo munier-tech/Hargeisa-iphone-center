@@ -3,6 +3,7 @@ Python port of the former PHP backend. The SQLite file, the encryption key and e
 from __future__ import annotations
 
 import base64, calendar, json, math, os, re, secrets, sqlite3, time
+import shutil
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -11,9 +12,9 @@ from flask import g, request, has_request_context
 import collections
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA = os.path.join(ROOT, 'data')
+DATA = os.path.abspath(os.environ.get('HIC_DATA_DIR', os.path.join(ROOT, 'data')))
 os.makedirs(DATA, exist_ok=True)
-DB_FILE = os.environ.get('HIC_DB', os.path.join(DATA, 'hic.sqlite'))
+DB_FILE = os.path.abspath(os.environ.get('HIC_DB', os.path.join(DATA, 'hic.sqlite')))
 TZ = timezone(timedelta(hours=3))            # Africa/Mogadishu (no daylight saving)
 
 
@@ -267,8 +268,34 @@ def seed() -> None:
                  'website': 'www.hargeisaiphonecenter.com', 'social': 'Facebook / Instagram / TikTok: @hargeisaiphonecenter', 'footer': '© HARGEISA IPHONE CENTER — Hubsiimo iyo Degdegsiimo', 'logo': '', 'currency': '$'}.items():
         q('INSERT INTO settings(k,v) VALUES(?,?)', (k, v))
 
+def _copy_missing_files(source: str, destination: str) -> None:
+    os.makedirs(destination, exist_ok=True)
+    for name in os.listdir(source):
+        src, dst = os.path.join(source, name), os.path.join(destination, name)
+        if os.path.isdir(src):
+            _copy_missing_files(src, dst)
+        elif not name.endswith(('-shm', '-wal')) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+
+
+def prepare_data_dir() -> None:
+    """Seed a new persistent data volume from the bundled data snapshot once."""
+    source_data = os.path.abspath(os.path.join(ROOT, 'data'))
+    if DATA == source_data or os.path.exists(DB_FILE): return
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    source_db = os.path.join(source_data, 'hic.sqlite')
+    if os.path.isfile(source_db): shutil.copy2(source_db, DB_FILE)
+    for name in ('app.key', 'backups', 'chat_files'):
+        source, destination = os.path.join(source_data, name), os.path.join(DATA, name)
+        if os.path.isdir(source): _copy_missing_files(source, destination)
+        elif os.path.isfile(source) and not os.path.exists(destination):
+            shutil.copy2(source, destination)
+
+
 def init_db() -> None:
     """Create / upgrade the database once at start-up."""
+    prepare_data_dir()
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     fresh = not os.path.exists(DB_FILE)
     c = sqlite3.connect(DB_FILE, isolation_level=None, timeout=8)
     c.row_factory = lambda cur, r: {col[0]: r[i] for i, col in enumerate(cur.description)}

@@ -14,6 +14,9 @@ users + notifications + regional repairs + customer portal.
 First-time setup on a new PC: `winget install -e --id Python.Python.3.12`, then run START-SYSTEM.bat.
 Optional environment variables: `HIC_HOST` (default `0.0.0.0`; use `127.0.0.1` for this-PC-only), `HIC_PORT` (default `8080`), `HIC_DB` (database path).
 
+## Deploy with persistent storage
+Vercel's serverless filesystem is read-only for deployed files and its `/tmp` storage is temporary, so it cannot safely host this SQLite-backed business system. The included `render.yaml` configures a Render web service with a persistent disk mounted at `/var/data`. On the disk's first start, the app copies the bundled database, encryption key, backups and chat files if no database exists there; subsequent starts keep using the disk's data. Keep the disk attached and maintain separate backups.
+
 ## Layout
 - `server/` — Python backend: `app.py` (web server + API dispatcher), `core.py` (database, sessions, security, finance totals),
   `acc.py` (items & stock, stores & bills, quotations & invoices, payments, expenses), `h_reports.py` (all reports),

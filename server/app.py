@@ -140,7 +140,7 @@ def initialize():
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     initialize()
-    host = os.environ.get('HIC_HOST', '0.0.0.0'); port = int(os.environ.get('HIC_PORT', '8080'))
+    host = os.environ.get('HIC_HOST', '0.0.0.0'); port = int(os.environ.get('HIC_PORT', os.environ.get('PORT', '8080')))
     try:
         from waitress import serve
         logging.getLogger('waitress').setLevel(logging.WARNING)
