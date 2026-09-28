@@ -68,6 +68,7 @@ CREATE TABLE expense_entries(id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT
 CREATE INDEX ix_exp_date ON expense_entries(date);
 CREATE TABLE money_accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, type TEXT DEFAULT 'cash', number TEXT, opening_balance REAL DEFAULT 0, opening_date TEXT, notes TEXT, active INTEGER DEFAULT 1, created_at INTEGER);
 CREATE TABLE acc_transfers(id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, amount REAL NOT NULL, fee REAL DEFAULT 0, fee_expense_id INTEGER, ref TEXT, note TEXT, user_id INTEGER, ts INTEGER);
+CREATE TABLE chat_files(name TEXT PRIMARY KEY, mime TEXT, size INTEGER, data BLOB, ts INTEGER);
 CREATE TABLE acc_moves(id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, date TEXT NOT NULL, amount REAL NOT NULL, kind TEXT, ref TEXT, note TEXT, user_id INTEGER, ts INTEGER);
 """
 
@@ -83,6 +84,8 @@ def sqlite_columns(s: sqlite3.Connection) -> dict:
     return {t: [x[1] for x in s.execute(f'PRAGMA table_info("{t}")').fetchall()]
             for (t,) in s.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()}
 
+KEEP_IF_MISSING = {'backup_files', 'chat_files'}   # a source without these tables (backup store, older backups) leaves them as they are
+
 def _has_id(t: str) -> bool: return t not in core.NO_ID          # tables with a generated numeric id
 
 def _cols(cols: list) -> str: return ', '.join(f'"{x}"' for x in cols)       # quoted: some column names (time, date, position) are SQL keywords
@@ -96,6 +99,7 @@ def sqlite_to_pg(src_path: str, c, log=None) -> dict:
     try:
         pgc, slc = pg_columns(c), sqlite_columns(s)
         seqs = dict(s.execute('SELECT name, seq FROM sqlite_sequence').fetchall()) if 'sqlite_sequence' in {r[0] for r in s.execute("SELECT name FROM sqlite_master WHERE type='table'")} else {}
+        pgc = {t: v for t, v in pgc.items() if t in slc or t not in KEEP_IF_MISSING}
         c.execute('TRUNCATE ' + ', '.join(pgc))
         counts = {}
         for t, cols in pgc.items():

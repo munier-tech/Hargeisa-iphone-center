@@ -1,12 +1,11 @@
 """Internal chat (staff to staff): 1-to-1 and group conversations, attachments, voice notes, read receipts, typing, presence, permissions, retention."""
 from __future__ import annotations
-import base64, os, re, secrets, time
+import base64, io, os, re, secrets, time
 
 from core import *
 import core
 
-CHAT_DIR = os.path.join(DATA, 'chat_files')
-os.makedirs(CHAT_DIR, exist_ok=True)
+CHAT_DIR = os.path.join(DATA, 'chat_files')          # only older attachments; new ones are stored in the chat_files table
 TYPING: dict = {}                                     # (conv_id, user_id) -> last typing timestamp (in memory, resets on restart)
 IMG = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp'}
 DOC = {'pdf': 'application/pdf', 'doc': 'application/msword', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'xls': 'application/vnd.ms-excel',
@@ -18,6 +17,10 @@ MIME = {**IMG, **DOC, **VOICE}
 
 # ------------------------------------------------------------------ permissions
 def chat_on() -> bool: return setting('chat_enabled', 'on') != 'off'
+
+def max_mb() -> int:
+    """Largest attachment. Vercel refuses requests over 4.5 MB, so there a file (sent as base64) is capped at 3 MB."""
+    m = max(1, I(setting('chat_max_mb', '10'))); return min(m, 3) if core.ON_VERCEL else m
 
 def need_chat(perm: str = 'chat') -> dict:
     u = me()
@@ -45,7 +48,7 @@ def act_chat_users(inp):
     for r in rows("SELECT * FROM users WHERE status='active' AND id<>? ORDER BY name", (u['id'],)):
         if not chat_perm_dict(r)['chat']: continue
         p = public_user(r); out.append({'id': p['id'], 'name': p['name'], 'position': 'System Owner' if p['is_owner'] else 'Super Admin' if p['is_admin'] else p['position'], 'avatar': p['avatar'], 'online': p['online'], 'last_seen': p['last_seen']})
-    return {'users': out, 'perms': chat_perm_dict(u), 'me': int(u['id']), 'max_mb': max(1, I(setting('chat_max_mb', '10')))}
+    return {'users': out, 'perms': chat_perm_dict(u), 'me': int(u['id']), 'max_mb': max_mb()}
 
 def act_chat_open(inp):
     u = need_chat(); other = I(inp.get('user_id')); o = row("SELECT * FROM users WHERE id=? AND status='active'", (other,))
@@ -134,10 +137,10 @@ def _save_att(att: dict, perms: dict) -> tuple:
     raw = str(att.get('data') or ''); raw = raw.split(',', 1)[1] if raw.startswith('data:') and ',' in raw else raw
     try: blob = base64.b64decode(raw, validate=True)
     except Exception: raise ApiError('The attachment could not be read.')
-    limit = max(1, I(setting('chat_max_mb', '10'))) * 1024 * 1024
+    limit = max_mb() * 1024 * 1024
     if not blob or len(blob) > limit: raise ApiError(f'The file is too large (limit {limit // 1048576} MB).')
     fname = secrets.token_hex(16) + '.' + ext
-    with open(os.path.join(CHAT_DIR, fname), 'wb') as fh: fh.write(blob)
+    q('INSERT INTO chat_files(name,mime,size,data,ts) VALUES(?,?,?,?,?)', (fname, MIME.get(ext), len(blob), blob, now()))
     return kind, name if kind != 'voice' else 'Voice note', fname, len(blob)
 
 def act_chat_send(inp):
@@ -160,21 +163,23 @@ def act_chat_delete(inp):
     if not u['is_admin']:
         if int(m['user_id']) != uid: raise ApiError('You can only delete your own messages.', 403)
         if not chat_perm_dict(u)['delete']: raise ApiError('You are not allowed to delete messages.', 403)
-    if m['att_file']:
-        try: os.remove(os.path.join(CHAT_DIR, m['att_file']))
-        except OSError: pass
+    if m['att_file']: _drop_file(m['att_file'])
     q("UPDATE chat_msgs SET deleted=1,body='',att_file=NULL,att_kind=NULL,deleted_by=?,deleted_ts=? WHERE id=?", (uid, now(), m['id']))
     if u['is_admin'] and int(m['user_id']) != uid: audit('delete', 'chat_message', int(m['id']), 'by Super Admin')
     return []
 
 def serve_file(mid: int):
     """Flask route helper: only members of the conversation can open an attachment."""
-    from flask import abort, send_from_directory, make_response
+    from flask import abort, send_file, send_from_directory, make_response
     u = me(False)
     if not u or not chat_on() or not chat_perm_dict(u)['chat']: abort(404)
     m = row('SELECT * FROM chat_msgs WHERE id=?', (mid,))
     if not m or m['deleted'] or not m['att_file'] or not member(int(m['conv_id']), int(u['id'])): abort(404)
-    ext = m['att_file'].rsplit('.', 1)[-1]; resp = make_response(send_from_directory(CHAT_DIR, m['att_file'], mimetype=MIME.get(ext, 'application/octet-stream'), as_attachment=ext not in IMG and ext not in VOICE, download_name=m['att_name'] or m['att_file']))
+    ext = m['att_file'].rsplit('.', 1)[-1]; opts = dict(mimetype=MIME.get(ext, 'application/octet-stream'), as_attachment=ext not in IMG and ext not in VOICE, download_name=m['att_name'] or m['att_file'])
+    blob = val('SELECT data FROM chat_files WHERE name=?', (m['att_file'],))
+    if blob is not None: resp = make_response(send_file(io.BytesIO(bytes(blob)), **opts))
+    elif os.path.isfile(os.path.join(CHAT_DIR, m['att_file'])): resp = make_response(send_from_directory(CHAT_DIR, m['att_file'], **opts))
+    else: abort(404)
     resp.headers['X-Content-Type-Options'] = 'nosniff'; resp.headers['Cache-Control'] = 'private, max-age=3600'; resp.headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'"
     return resp
 
@@ -224,14 +229,14 @@ def act_chat_group_rename(inp):
 
 # ------------------------------------------------------------------ Super Admin: chat permissions, settings, retention
 def _settings() -> dict:
-    return {'enabled': chat_on(), 'retention_days': max(0, I(setting('chat_retention_days', '0'))), 'max_mb': max(1, I(setting('chat_max_mb', '10')))}
+    return {'enabled': chat_on(), 'retention_days': max(0, I(setting('chat_retention_days', '0'))), 'max_mb': max_mb()}
 
 def act_chat_perms_get(inp):
     admin(); out = []
     for r in rows("SELECT * FROM users WHERE is_admin=0 ORDER BY status, name"):
         p = public_user(r); out.append({'id': p['id'], 'name': p['name'], 'position': p['position'], 'status': p['status'], 'perms': chat_perm_dict(r), 'online': p['online']})
     st = row("SELECT (SELECT COUNT(*) FROM chat_msgs WHERE deleted=0) AS msgs,(SELECT COUNT(*) FROM chat_convs) AS convs,(SELECT COUNT(*) FROM chat_convs WHERE kind='group') AS groups").copy()
-    files = sum(os.path.getsize(os.path.join(CHAT_DIR, f)) for f in os.listdir(CHAT_DIR)) if os.path.isdir(CHAT_DIR) else 0
+    files = int(val('SELECT COALESCE(SUM(size),0) FROM chat_files') or 0)
     return {'users': out, 'settings': _settings(), 'stats': {**st, 'files_bytes': files}}
 
 def act_chat_perms_save(inp):
@@ -250,12 +255,15 @@ def act_chat_settings_save(inp):
     audit('update', 'settings', None, 'chat')
     return _settings()
 
+def _drop_file(name: str) -> None:
+    q('DELETE FROM chat_files WHERE name=?', (name,))
+    try: os.remove(os.path.join(CHAT_DIR, name))           # an older attachment still on disk
+    except OSError: pass
+
 def _purge(days: int) -> int:
     cut = now() - days * 86400; n_ = 0
     for m in rows('SELECT id,att_file FROM chat_msgs WHERE ts<?', (cut,)):
-        if m['att_file']:
-            try: os.remove(os.path.join(CHAT_DIR, m['att_file']))
-            except OSError: pass
+        if m['att_file']: _drop_file(m['att_file'])
         n_ += 1
     q('DELETE FROM chat_msgs WHERE ts<?', (cut,))
     return n_

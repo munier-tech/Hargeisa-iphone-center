@@ -8,18 +8,49 @@ from core import *
 import core, pgsync
 
 BACKUP_DIR = os.path.join(DATA, 'backups')
-os.makedirs(BACKUP_DIR, exist_ok=True)
+if not core.BACKUPS_IN_DB: os.makedirs(BACKUP_DIR, exist_ok=True)
 FILE_RE = re.compile(r'^hic_(auto|manual|pre-restore)_\d{8}_\d{6}\.sqlite$')
 DOC_KEYS = ['doc_prefix', 'doc_terms', 'doc_note', 'doc_paper', 'doc_show_logo']                       # public (printed on documents)
 SEC_KEYS = {'sec_min_pw': (6, 64), 'sec_max_attempts': (3, 50), 'sec_lock_min': (1, 240), 'sec_idle_min': (5, 720)}
 BK_KEYS = ['bk_auto', 'bk_keep']
-LIVE_TABLES_SQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE' ORDER BY table_name"
+LIVE_TABLES_SQL = "SELECT table_name AS name FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE' AND table_name NOT IN ('backup_files') ORDER BY table_name"
 
 
 # ------------------------------------------------------------------ backup engine
 # The live data is in PostgreSQL; a backup is a complete snapshot written to a normal SQLite file (hic_*.sqlite), so it can be
 # downloaded, verified, test-restored and restored exactly as before. It runs on its own pooled connection, so it also works
 # from the background thread and never holds the request's transaction open.
+# Where the files are kept: data/backups on a normal server; the backup_files table on serverless hosting (Vercel), whose disk is
+# wiped between requests. The file content is identical either way.
+def _tmp_path(name: str) -> str:
+    os.makedirs(core.TMP, exist_ok=True); return os.path.join(core.TMP, name)
+
+def _store_list() -> list:
+    """[{file, size, mtime}] of every backup file in the store."""
+    if core.BACKUPS_IN_DB: return [{'file': r['file'], 'size': int(r['size'] or 0), 'mtime': int(r['ts'] or 0)} for r in rows('SELECT file,size,ts FROM backup_files') if FILE_RE.match(r['file'])]
+    return [{'file': f, 'size': os.path.getsize(os.path.join(BACKUP_DIR, f)), 'mtime': int(os.path.getmtime(os.path.join(BACKUP_DIR, f)))} for f in os.listdir(BACKUP_DIR) if FILE_RE.match(f)]
+
+def _store_has(f: str) -> bool:
+    if core.BACKUPS_IN_DB: return bool(val('SELECT 1 FROM backup_files WHERE file=?', (f,)))
+    return os.path.isfile(os.path.join(BACKUP_DIR, f))
+
+def _local(f: str) -> str:
+    """A path to the backup file on this machine (on Vercel: a temporary copy taken from the database)."""
+    if not core.BACKUPS_IN_DB: return os.path.join(BACKUP_DIR, f)
+    data = val('SELECT data FROM backup_files WHERE file=?', (f,)); p = _tmp_path(f)
+    with open(p, 'wb') as fh: fh.write(bytes(data or b''))
+    return p
+
+def _done(path: str) -> None:
+    if core.BACKUPS_IN_DB:                                            # temporary copy only
+        try: os.remove(path)
+        except OSError: pass
+
+def _store_drop(c, f: str) -> None:
+    if core.BACKUPS_IN_DB: cq(c, 'DELETE FROM backup_files WHERE file=?', (f,)); return
+    try: os.remove(os.path.join(BACKUP_DIR, f))
+    except OSError: pass
+
 def _check(path: str) -> tuple[bool, dict]:
     """Open a backup file read-only, run SQLite's integrity check and count the rows of every table."""
     try:
@@ -33,19 +64,24 @@ def _check(path: str) -> tuple[bool, dict]:
         return False, {'error': str(e)}
 
 def make_backup(kind: str = 'manual', user_id: int | None = None, note: str = '') -> dict:
-    name = f"hic_{kind}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite"; dest = os.path.join(BACKUP_DIR, name)
+    name = f"hic_{kind}_{local_now().strftime('%Y%m%d_%H%M%S')}.sqlite"
+    dest = _tmp_path(name) if core.BACKUPS_IN_DB else os.path.join(BACKUP_DIR, name)
     with core.pool().connection() as c:
-        pgsync.pg_to_sqlite(c, dest)                       # consistent snapshot, safe while the system is in use
-        ok, _ = _check(dest); size = os.path.getsize(dest)
+        try:
+            pgsync.pg_to_sqlite(c, dest)                       # consistent snapshot, safe while the system is in use
+            ok, _ = _check(dest); size = os.path.getsize(dest)
+            if core.BACKUPS_IN_DB:
+                with open(dest, 'rb') as fh: data = fh.read()
+                cq(c, 'INSERT INTO backup_files(file,size,ts,data) VALUES(?,?,?,?) ON CONFLICT(file) DO UPDATE SET size=excluded.size, ts=excluded.ts, data=excluded.data', (name, size, now(), data))
+        finally:
+            if core.BACKUPS_IN_DB and os.path.exists(dest): os.remove(dest)
         cq(c, 'INSERT INTO backups(file,kind,size,ts,user_id,note,verified_ts,verified_ok) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file) DO UPDATE SET '
               'kind=excluded.kind, size=excluded.size, ts=excluded.ts, user_id=excluded.user_id, note=excluded.note, verified_ts=excluded.verified_ts, verified_ok=excluded.verified_ok',
            (name, kind, size, now(), user_id, note, now(), 1 if ok else 0))
         keep = max(3, I(_get(c, 'bk_keep', '14')))
         old = [r['file'] for r in cq(c, "SELECT file FROM backups WHERE kind='auto' ORDER BY ts DESC").fetchall()][keep:]
         for f in old:
-            try: os.remove(os.path.join(BACKUP_DIR, f))
-            except OSError: pass
-            cq(c, 'DELETE FROM backups WHERE file=?', (f,))
+            _store_drop(c, f); cq(c, 'DELETE FROM backups WHERE file=?', (f,))
     return {'file': name, 'size': size, 'ok': ok}
 
 def _get(c, k, dflt=''):
@@ -62,19 +98,23 @@ def auto_backup_loop() -> None:
         except Exception as e: core.ERRLOG.append({'ts': now(), 'where': 'auto-backup', 'msg': str(e)})
         time.sleep(1800)
 
+def auto_backup_if_due() -> None:
+    """Serverless hosting has no background thread: the heartbeat calls this (at most once a minute) instead."""
+    if setting('bk_auto', 'on') == 'off': return
+    if now() - int(val("SELECT MAX(ts) FROM backups WHERE kind='auto'") or 0) >= 24 * 3600: make_backup('auto', None, 'Scheduled automatic backup')
+
 def db_size() -> int: return int(val('SELECT pg_database_size(current_database())') or 0)
 
 
 def act_backup_list(inp):
     admin(); out = []
     known = {r['file']: r for r in rows('SELECT b.*,u.name by_name FROM backups b LEFT JOIN users u ON u.id=b.user_id')}
-    for f in sorted(os.listdir(BACKUP_DIR), reverse=True):
-        if not FILE_RE.match(f): continue
-        m = known.get(f, {}); p = os.path.join(BACKUP_DIR, f)
-        out.append({'file': f, 'kind': m.get('kind') or f.split('_')[1], 'size': os.path.getsize(p), 'ts': m.get('ts') or int(os.path.getmtime(p)), 'by': m.get('by_name') or ('System' if f.startswith('hic_auto') else ''),
+    for x in _store_list():
+        f = x['file']; m = known.get(f, {})
+        out.append({'file': f, 'kind': m.get('kind') or f.split('_')[1], 'size': x['size'], 'ts': m.get('ts') or x['mtime'], 'by': m.get('by_name') or ('System' if f.startswith('hic_auto') else ''),
                     'note': m.get('note') or '', 'verified_ts': m.get('verified_ts'), 'verified_ok': m.get('verified_ok')})
     out.sort(key=lambda x: -x['ts'])
-    return {'items': out, 'dir': BACKUP_DIR, 'auto': setting('bk_auto', 'on') != 'off', 'keep': I(setting('bk_keep', '14')) or 14, 'db_size': db_size()}
+    return {'items': out, 'dir': 'PostgreSQL database (backup_files table)' if core.BACKUPS_IN_DB else BACKUP_DIR, 'auto': setting('bk_auto', 'on') != 'off', 'keep': I(setting('bk_keep', '14')) or 14, 'db_size': db_size()}
 
 def act_backup_create(inp):
     u = admin(); note = s(inp.get('note'), 120)
@@ -85,16 +125,18 @@ def act_backup_create(inp):
 
 def _pick(inp) -> str:
     f = str(inp.get('file') or '')
-    if not FILE_RE.match(f) or not os.path.isfile(os.path.join(BACKUP_DIR, f)): raise ApiError('Backup file not found.', 404)
+    if not FILE_RE.match(f) or not _store_has(f): raise ApiError('Backup file not found.', 404)
     return f
 
 def act_backup_delete(inp):
-    admin(); f = _pick(inp); os.remove(os.path.join(BACKUP_DIR, f)); q('DELETE FROM backups WHERE file=?', (f,)); audit('delete', 'backup', None, f)
+    admin(); f = _pick(inp); _store_drop(db(), f); q('DELETE FROM backups WHERE file=?', (f,)); audit('delete', 'backup', None, f)
     return []
 
 def act_backup_verify(inp):
     """Backup verification: integrity check + row counts compared with the live database."""
-    admin(); f = _pick(inp); ok, counts = _check(os.path.join(BACKUP_DIR, f))
+    admin(); f = _pick(inp); p = _local(f)
+    try: ok, counts = _check(p)
+    finally: _done(p)
     live = {t['name']: val(f'SELECT COUNT(*) FROM "{t["name"]}"') for t in rows(LIVE_TABLES_SQL)}
     q('UPDATE backups SET verified_ts=?, verified_ok=? WHERE file=?', (now(), 1 if ok else 0, f))
     audit('verify', 'backup', None, f)
@@ -102,9 +144,9 @@ def act_backup_verify(inp):
 
 def act_recovery_test(inp):
     """Restore test: restores the backup into a temporary copy (the live data is never touched) and proves it opens, passes checks and holds the essential data."""
-    admin(); f = _pick(inp); tmp = os.path.join(BACKUP_DIR, f'_restore_test_{now()}.tmp'); steps = []
+    admin(); f = _pick(inp); tmp = _tmp_path(f'_restore_test_{now()}.tmp'); steps = []; src = None
     try:
-        shutil.copyfile(os.path.join(BACKUP_DIR, f), tmp); steps.append(('Copy backup to a temporary restore area', True))
+        src = _local(f); shutil.copyfile(src, tmp); steps.append(('Copy backup to a temporary restore area', True))
         ok, counts = _check(tmp); steps.append(('SQLite integrity check', ok))
         c = sqlite3.connect(tmp)
         try:
@@ -122,6 +164,7 @@ def act_recovery_test(inp):
     finally:
         try: os.remove(tmp)
         except OSError: pass
+        if src: _done(src)
     good = all(x[1] for x in steps); q('UPDATE backups SET verified_ts=?, verified_ok=? WHERE file=?', (now(), 1 if good else 0, f)); audit('restore_test', 'backup', None, f)
     return {'ok': good, 'steps': [{'step': a, 'ok': b} for a, b in steps]}
 
@@ -130,12 +173,15 @@ def act_backup_restore(inp):
     The whole restore runs inside this request's transaction: if anything fails, nothing changes."""
     u = admin(); f = _pick(inp)
     if str(inp.get('confirm') or '') != 'RESTORE': raise ApiError('Type RESTORE to confirm.')
-    path = os.path.join(BACKUP_DIR, f); ok, counts = _check(path)
-    if not ok: raise ApiError('This backup failed verification and cannot be restored.')
-    if 'sdocs' not in counts: raise ApiError('This backup was made before the accounting rebuild and cannot be restored into the PostgreSQL database.')
-    sess = row('SELECT * FROM sessions WHERE id=?', (request.cookies.get('HICSESS', ''),))
-    safety = make_backup('pre-restore', int(u['id']), f'Automatic safety copy before restoring {f}')
-    pgsync.sqlite_to_pg(path, db())
+    path = _local(f)
+    try:
+        ok, counts = _check(path)
+        if not ok: raise ApiError('This backup failed verification and cannot be restored.')
+        if 'sdocs' not in counts: raise ApiError('This backup was made before the accounting rebuild and cannot be restored into the PostgreSQL database.')
+        sess = row('SELECT * FROM sessions WHERE id=?', (request.cookies.get('HICSESS', ''),))
+        safety = make_backup('pre-restore', int(u['id']), f'Automatic safety copy before restoring {f}')
+        pgsync.sqlite_to_pg(path, db())
+    finally: _done(path)
     setup(fresh_seed=False)                                            # bring an older backup up to the current structure
     if sess and val('SELECT 1 FROM users WHERE id=? AND is_admin=1', (sess['uid'],)):     # keep the admin signed in
         q('INSERT INTO sessions(id,kind,uid,remember,created,last,ip,ua) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, uid=excluded.uid, remember=excluded.remember, created=excluded.created, last=excluded.last, ip=excluded.ip, ua=excluded.ua',
@@ -151,10 +197,13 @@ def act_backup_settings(inp):
 
 def download_backup(name: str):
     """Flask route helper: stream a backup file to a signed-in Super Admin."""
-    from flask import abort, send_from_directory
+    import io
+    from flask import abort, send_file, send_from_directory
     u = me(False)
-    if not u or not u['is_admin'] or not FILE_RE.match(name or ''): abort(404)
+    if not u or not u['is_admin'] or not FILE_RE.match(name or '') or not _store_has(name): abort(404)
     audit('export', 'backup', None, name)
+    if core.BACKUPS_IN_DB:
+        return send_file(io.BytesIO(bytes(val('SELECT data FROM backup_files WHERE file=?', (name,)))), mimetype='application/octet-stream', as_attachment=True, download_name=name)
     return send_from_directory(BACKUP_DIR, name, as_attachment=True)
 
 
@@ -218,14 +267,15 @@ def act_health(inp):
         du = shutil.disk_usage(DATA); free = du.free
         add('Disk space', 'ok' if free > 5e9 else 'warn' if free > 1e9 else 'crit', f'{free / 1e9:.1f} GB free of {du.total / 1e9:.0f} GB')
     except Exception as e: add('Disk space', 'warn', str(e)); du = None
-    bks = [f for f in os.listdir(BACKUP_DIR) if FILE_RE.match(f)]; last = core.last_backup_ts() or None; bsize = sum(os.path.getsize(os.path.join(BACKUP_DIR, f)) for f in bks)
+    bks = _store_list(); last = core.last_backup_ts() or None; bsize = sum(x['size'] for x in bks)
     age = (now() - int(last)) / 3600 if last else None
     add('Backups', 'crit' if age is None else 'ok' if age < 30 else 'warn' if age < 72 else 'crit', 'No backup yet' if age is None else f'{len(bks)} file(s), {bsize / 1e6:.1f} MB — last {age:.0f} h ago')
     bad = int(val('SELECT COUNT(*) FROM backups WHERE verified_ok=0') or 0)
     add('Backup verification', 'ok' if not bad else 'warn', 'All checked backups are valid' if not bad else f'{bad} backup(s) failed verification')
     recent_err = [e for e in core.ERRLOG if now() - e['ts'] < 3600]
     add('Server errors (last hour)', 'ok' if not recent_err else 'warn' if len(recent_err) < 5 else 'crit', f'{len(recent_err)} error(s)')
-    add('Encryption key', 'ok' if os.path.exists(os.path.join(DATA, 'app.key')) else 'crit', 'app.key found' if os.path.exists(os.path.join(DATA, 'app.key')) else 'app.key MISSING — Apple ID passwords cannot be decrypted')
+    ks = core.appkey_source()
+    add('Encryption key', 'ok' if ks != 'missing' else 'crit', f'{ks} found' if ks != 'missing' else 'app.key MISSING — Apple ID passwords cannot be decrypted')
     n_staff = int(val("SELECT COUNT(*) FROM sessions WHERE kind='staff'") or 0); n_portal = int(val("SELECT COUNT(*) FROM sessions WHERE kind='portal'") or 0)
     add('Sessions', 'ok', f'{n_staff} staff / {n_portal} customer session(s)')
     up = time.time() - core.STATS['start']

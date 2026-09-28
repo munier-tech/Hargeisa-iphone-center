@@ -1,0 +1,9 @@
+# Not needed on Vercel (the data lives in Neon PostgreSQL) — and the old database / backups must never be uploaded.
+data/hic.sqlite*
+data/backups/
+data/.htaccess
+legacy_php/
+**/__pycache__/
+*.bat
+.env
+.env.*

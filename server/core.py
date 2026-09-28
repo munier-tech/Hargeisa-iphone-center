@@ -38,6 +38,11 @@ def _load_env_file() -> None:
 
 _load_env_file()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+# Serverless hosting (Vercel): the disk is read-only (only a temporary /tmp that is wiped), and nothing runs between requests.
+# There, chat attachments and backups are kept inside PostgreSQL, and the daily automatic backup runs from the heartbeat.
+ON_VERCEL = bool(os.environ.get('VERCEL'))
+BACKUPS_IN_DB = ON_VERCEL or os.environ.get('HIC_BACKUP_STORE', '').lower() == 'db'
+TMP = os.environ.get('HIC_TMP') or os.path.join('/tmp' if ON_VERCEL else DATA, 'tmp')    # scratch space for backup files
 
 
 class ApiError(Exception):
@@ -134,7 +139,7 @@ def pool() -> ConnectionPool:
     global _pool
     with _pool_lock:
         if _pool is None:
-            _pool = ConnectionPool(db_url(), min_size=1, max_size=max(4, int(os.environ.get('HIC_DB_POOL', '12'))), name='hic', open=True, timeout=30, max_idle=240,
+            _pool = ConnectionPool(db_url(), min_size=1, max_size=max(2, int(os.environ.get('HIC_DB_POOL', '4' if ON_VERCEL else '12'))), name='hic', open=True, timeout=30, max_idle=240,
                                    kwargs={'autocommit': True, 'row_factory': dict_row, 'prepare_threshold': None, 'connect_timeout': 20},
                                    check=ConnectionPool.check_connection)          # a connection closed by Neon while idle is replaced transparently
     return _pool
@@ -170,7 +175,7 @@ def val(sql: str, p=()):
     r = q(sql, p).fetchone()
     return None if r is None else next(iter(r.values()))
 
-NO_ID = {'settings', 'sessions', 'chat_members', 'backups'}     # tables whose key is not an `id` column
+NO_ID = {'settings', 'sessions', 'chat_members', 'backups', 'chat_files', 'backup_files'}     # tables whose key is not an `id` column
 def ins(table: str, dct: dict) -> int:
     cols = list(dct); sql = f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' * len(cols))})"
     if table in NO_ID: q(sql, [dct[c] for c in cols]); return 0
@@ -272,6 +277,12 @@ SCHEMA = [
     'CREATE UNIQUE INDEX IF NOT EXISTS ux_expcat_name ON exp_categories(lower(name))',
     'CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_name ON money_accounts(lower(name))',
 ]
+SCHEMA += [
+    # chat attachments (the file content lives in the database, so it works on read-only / serverless hosting too)
+    'CREATE TABLE IF NOT EXISTS chat_files(name TEXT PRIMARY KEY, mime TEXT, size BIGINT, data BYTEA, ts BIGINT)',
+    # backup files, when they are kept in the database (Vercel) instead of data/backups
+    'CREATE TABLE IF NOT EXISTS backup_files(file TEXT PRIMARY KEY, size BIGINT, ts BIGINT, data BYTEA)',
+]
 TABLES = [m.group(1) for m in (re.match(r'CREATE TABLE IF NOT EXISTS (\w+)', x) for x in SCHEMA) if m]
 
 def schema() -> None:
@@ -330,6 +341,14 @@ def migrate() -> None:
             for t in ('cust_payments', 'vendor_payments', 'expense_entries', 'repair_payments', 'soft_payments'): q(f'UPDATE {t} SET account_id=NULL WHERE account_id=?', (a['id'],))
             q('DELETE FROM money_accounts WHERE id=?', (a['id'],))
         _set_flag('mig_v11')
+    if not _flag('mig_chat_db'):  # chat attachments move from data/chat_files into the database
+        d_ = os.path.join(DATA, 'chat_files')
+        for f in (sorted(os.listdir(d_)) if os.path.isdir(d_) else []):
+            p = os.path.join(d_, f)
+            if os.path.isfile(p) and not val('SELECT 1 FROM chat_files WHERE name=?', (f,)):
+                with open(p, 'rb') as fh: data = fh.read()
+                q('INSERT INTO chat_files(name,mime,size,data,ts) VALUES(?,?,?,?,?)', (f, None, len(data), data, int(os.path.getmtime(p))))
+        _set_flag('mig_chat_db')
 
 def _has(table: str) -> bool: return bool(val("SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?", (table,)))
 
@@ -354,15 +373,21 @@ def setup(fresh_seed: bool = True) -> None:
     if fresh_seed and not val('SELECT 1 FROM users LIMIT 1'): seed()   # brand-new, empty database
     migrate()
 
+SCHEMA_ID = __import__('hashlib').sha1('\n'.join(SCHEMA).encode()).hexdigest()[:16]    # changes whenever the table layout changes
+
 def init_db() -> None:
-    """Create / upgrade the database once at start-up."""
+    """Create / upgrade the database once at start-up. When the database already has this exact layout, nothing is re-run
+    (keeps serverless cold starts fast)."""
     from flask import Flask
     app = Flask('init'); c = pool().getconn()
     try:
         with app.app_context():
             g.db = c
+            try: current = val("SELECT v FROM settings WHERE k='schema_id'")
+            except psycopg.Error: current = None                      # brand-new database: no tables yet
+            if current == SCHEMA_ID: return
             q('BEGIN')
-            try: setup(); q('COMMIT')
+            try: setup(); set_setting('schema_id', SCHEMA_ID); q('COMMIT')
             except BaseException: q('ROLLBACK'); raise
     finally: release(c)
 
@@ -385,11 +410,24 @@ STATS = {'start': time.time(), 'req': 0, 'err': 0}                       # healt
 ERRLOG: collections.deque = collections.deque(maxlen=30)
 
 
+_KEY: list = []
 def appkey() -> bytes:
-    f = os.path.join(DATA, 'app.key')
-    if not os.path.exists(f):
-        with open(f, 'w') as fh: fh.write(secrets.token_hex(32))
-    with open(f) as fh: return bytes.fromhex(fh.read().strip())
+    """The Apple ID encryption key: HIC_APP_KEY environment variable (64 hex characters), else data/app.key.
+    A new key is only ever created on a normal server — on serverless hosting a missing key is an error, because a key made
+    there would be lost and every password saved with it could never be read again."""
+    if _KEY: return _KEY[0]
+    k = os.environ.get('HIC_APP_KEY', '').strip()
+    if not k:
+        f = os.path.join(DATA, 'app.key')
+        if not os.path.exists(f):
+            if ON_VERCEL: raise RuntimeError('The encryption key is missing: set HIC_APP_KEY (the 64 characters in data/app.key) in the Vercel project settings.')
+            with open(f, 'w') as fh: fh.write(secrets.token_hex(32))
+        with open(f) as fh: k = fh.read().strip()
+    _KEY.append(bytes.fromhex(k)); return _KEY[0]
+
+def appkey_source() -> str:
+    if os.environ.get('HIC_APP_KEY', '').strip(): return 'HIC_APP_KEY'
+    return 'app.key' if os.path.exists(os.path.join(DATA, 'app.key')) else 'missing'
 
 def enc(text: str) -> str:
     iv = os.urandom(12); out = AESGCM(appkey()).encrypt(iv, text.encode(), None)
@@ -651,10 +689,15 @@ def run_checks() -> None:
         import h_chat
         with savepoint(): h_chat.purge_if_due(td)
     except Exception: pass
+    if ON_VERCEL:                   # no background thread on serverless hosting: the heartbeat takes the daily automatic backup
+        try:
+            import h_center; h_center.auto_backup_if_due()
+        except Exception as e: ERRLOG.append({'ts': now(), 'where': 'auto-backup', 'msg': str(e)[:300]})
 
 
 def last_backup_ts() -> int:
-    """Newest backup file on disk (the file system is the source of truth, so this survives a restore)."""
+    """Newest backup (the file system — or the backup store in the database — is the source of truth, so this survives a restore)."""
+    if BACKUPS_IN_DB: return int(val('SELECT COALESCE(MAX(ts),0) FROM backup_files') or 0)
     d_ = os.path.join(DATA, 'backups')
     try: return max([int(os.path.getmtime(os.path.join(d_, f))) for f in os.listdir(d_) if f.startswith('hic_') and f.endswith('.sqlite')] or [0])
     except OSError: return 0

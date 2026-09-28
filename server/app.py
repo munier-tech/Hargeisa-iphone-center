@@ -21,6 +21,9 @@ import mimetypes
 mimetypes.add_type('application/manifest+json', '.webmanifest')
 PUBLIC = os.path.join(ROOT, 'public')
 app = Flask(__name__, static_folder=None)
+if core.ON_VERCEL:                                  # behind Vercel's proxy: use the visitor's real IP (login lock-out, audit log)
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config['JSON_AS_ASCII'] = False
 log = logging.getLogger('hic')
 _startup_lock = threading.Lock()
@@ -131,7 +134,8 @@ def initialize():
     with _startup_lock:
         if _started: return
         core.init_db()
-        threading.Thread(target=h_center.auto_backup_loop, name='auto-backup', daemon=True).start()
+        if not core.ON_VERCEL:                          # serverless: no background thread (the heartbeat takes the daily backup)
+            threading.Thread(target=h_center.auto_backup_loop, name='auto-backup', daemon=True).start()
         _started = True
 
 
