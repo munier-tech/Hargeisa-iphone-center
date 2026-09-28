@@ -1,12 +1,18 @@
 """HARGEISA IPHONE CENTER — core: database, sessions, security helpers, scheduled checks.
-Python port of the former PHP backend. The SQLite file, the encryption key and every JSON API shape are unchanged."""
+Python port of the former PHP backend. The data now lives in PostgreSQL (Neon) — the connection string comes from the
+DATABASE_URL environment variable (or a local, git-ignored .env file). The encryption key and every JSON API shape are unchanged."""
 from __future__ import annotations
 
-import base64, calendar, json, math, os, re, secrets, sqlite3, time
-import shutil
+import base64, calendar, json, math, os, re, secrets, threading, time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
+import psycopg
+from psycopg.adapt import Dumper, Loader
+from psycopg.pq import TransactionStatus
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import g, request, has_request_context
 import collections
@@ -14,8 +20,24 @@ import collections
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.abspath(os.environ.get('HIC_DATA_DIR', os.path.join(ROOT, 'data')))
 os.makedirs(DATA, exist_ok=True)
-DB_FILE = os.path.abspath(os.environ.get('HIC_DB', os.path.join(DATA, 'hic.sqlite')))
 TZ = timezone(timedelta(hours=3))            # Africa/Mogadishu (no daylight saving)
+PG_TZ = "INTERVAL '+03:00'"                # the same fixed offset, for SQL (needs no time-zone database on the server)
+
+
+def _load_env_file() -> None:
+    """Read KEY=VALUE lines from <project>/.env into the environment (real environment variables always win).
+    Lets the Windows start-up script work without typing the connection string; .env is git-ignored."""
+    f = os.path.join(ROOT, '.env')
+    if not os.path.isfile(f): return
+    with open(f, encoding='utf-8-sig') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line: continue
+            k, v = line.split('=', 1); k = k.strip().removeprefix('export ').strip(); v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ: os.environ[k] = v
+
+_load_env_file()
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 
 
 class ApiError(Exception):
@@ -73,96 +95,196 @@ def valid_email(e: str) -> bool: return bool(EMAIL_RE.match(e or '')) and '..' n
 def unique(seq): return list(dict.fromkeys(seq))
 
 
-# ------------------------------------------------------------------ database
-def db() -> sqlite3.Connection:
-    if 'db' not in g:
-        c = sqlite3.connect(DB_FILE, timeout=8, isolation_level=None, check_same_thread=False)
-        c.row_factory = lambda cur, r: {col[0]: r[i] for i, col in enumerate(cur.description)}
-        c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA busy_timeout=8000')
-        g.db = c
+# ------------------------------------------------------------------ database (PostgreSQL / Neon)
+# SQL in this code base is written with `?` placeholders (as before); q() turns them into PostgreSQL parameters.
+# Python ints / bools are sent *untyped*, so PostgreSQL casts them to whatever the column needs — the same forgiving
+# behaviour SQLite had (e.g. comparing a TEXT column with a number). NUMERIC results (SUM of integers, AVG, ROUND) come
+# back as int when whole, otherwise float — exactly the values SQLite used to return, so every JSON response is unchanged.
+class _LooseInt(Dumper):
+    oid = 0                                                     # "unknown": PostgreSQL infers the type from the context
+    def dump(self, obj): return str(int(obj)).encode()
+
+class _NumLoader(Loader):
+    def load(self, data):
+        t = bytes(data).decode()
+        try: return int(t)
+        except ValueError: return float(t)
+
+psycopg.adapters.register_dumper(int, _LooseInt)
+psycopg.adapters.register_dumper(bool, _LooseInt)
+psycopg.adapters.register_loader('numeric', _NumLoader)
+
+_pool: ConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+def db_url() -> str:
+    if not DATABASE_URL:
+        raise RuntimeError('DATABASE_URL is not set. Put your Neon connection string in the DATABASE_URL environment variable '
+                           '(or in a .env file in the project folder) and start the server again.')
+    return DATABASE_URL
+
+def db_label() -> str:
+    """Where the data lives, for the System Health page — never includes the password."""
+    try:
+        i = psycopg.conninfo.conninfo_to_dict(db_url()); return f"PostgreSQL — {i.get('host', '?')}/{i.get('dbname', '?')}"
+    except Exception: return 'PostgreSQL'
+
+def pool() -> ConnectionPool:
+    """One shared pool of connections (a new TLS connection to Neon for every request would be slow)."""
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            _pool = ConnectionPool(db_url(), min_size=1, max_size=max(4, int(os.environ.get('HIC_DB_POOL', '12'))), name='hic', open=True, timeout=30, max_idle=240,
+                                   kwargs={'autocommit': True, 'row_factory': dict_row, 'prepare_threshold': None, 'connect_timeout': 20},
+                                   check=ConnectionPool.check_connection)          # a connection closed by Neon while idle is replaced transparently
+    return _pool
+
+def db() -> psycopg.Connection:
+    if 'db' not in g: g.db = pool().getconn()
     return g.db
 
-def q(sql: str, p=()): return db().execute(sql, tuple(p))
+def release(c) -> None:
+    try: pool().putconn(c)                                      # rolls back anything left open and returns it to the pool
+    except Exception: pass
+
+_SQL: dict = {}
+_QUOTED = re.compile(r"('(?:[^']|'')*'|\"[^\"]*\")")
+
+def pg(sql: str) -> str:
+    """`?` placeholders -> psycopg text parameters; a literal `%` must be doubled. Quoted strings are left alone."""
+    out = _SQL.get(sql)
+    if out is None:
+        parts = _QUOTED.split(sql)
+        out = ''.join(x.replace('%', '%%') if i % 2 else x.replace('%', '%%').replace('?', '%t') for i, x in enumerate(parts))
+        if len(_SQL) < 20000: _SQL[sql] = out
+    return out
+
+def cq(c, sql: str, p=()):
+    """Run a statement on a given connection (background threads, backups)."""
+    return c.execute(pg(sql), tuple(p))
+
+def q(sql: str, p=()): return cq(db(), sql, p)
 def rows(sql: str, p=()): return q(sql, p).fetchall()
 def row(sql: str, p=()): return q(sql, p).fetchone()
 def val(sql: str, p=()):
     r = q(sql, p).fetchone()
     return None if r is None else next(iter(r.values()))
+
+NO_ID = {'settings', 'sessions', 'chat_members', 'backups'}     # tables whose key is not an `id` column
 def ins(table: str, dct: dict) -> int:
-    cols = list(dct)
-    return q(f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' * len(cols))})", [dct[c] for c in cols]).lastrowid
+    cols = list(dct); sql = f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' * len(cols))})"
+    if table in NO_ID: q(sql, [dct[c] for c in cols]); return 0
+    return int(q(sql + ' RETURNING id', [dct[c] for c in cols]).fetchone()['id'])
 def upd(table: str, id_: int, dct: dict) -> None:
     if dct: q(f"UPDATE {table} SET {','.join(c + '=?' for c in dct)} WHERE id=?", [*dct.values(), id_])
 
+def in_tx() -> bool: return db().info.transaction_status != TransactionStatus.IDLE
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE, password TEXT NOT NULL, position TEXT NOT NULL DEFAULT 'Technician', is_admin INTEGER DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', avatar TEXT, perms TEXT DEFAULT '{}', logged_in INTEGER DEFAULT 0, last_seen INTEGER DEFAULT 0, session_start INTEGER DEFAULT 0, created_at INTEGER, approved_by INTEGER);
-CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT, entity TEXT, entity_id INTEGER, detail TEXT, ts INTEGER);
-CREATE INDEX IF NOT EXISTS ix_act_ts ON activity(ts);
-CREATE INDEX IF NOT EXISTS ix_act_user ON activity(user_id);
-CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, type TEXT, message TEXT, link TEXT, is_read INTEGER DEFAULT 0, ts INTEGER, ref TEXT);
-CREATE INDEX IF NOT EXISTS ix_notif_user ON notifications(user_id, is_read);
-CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT NOT NULL, phone_key TEXT NOT NULL UNIQUE, email TEXT, gender TEXT, address TEXT, notes TEXT, created_by INTEGER, created_at INTEGER);
-CREATE TABLE IF NOT EXISTS followups(id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL, type TEXT, note TEXT, due_date TEXT, done INTEGER DEFAULT 0, ref_kind TEXT, ref_id INTEGER, created_by INTEGER, created_at INTEGER, done_at INTEGER);
-CREATE TABLE IF NOT EXISTS repairs(id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL, device TEXT, imei TEXT, problem TEXT, diagnosis TEXT, diagnosis_notes TEXT, required_parts TEXT, technician_id INTEGER, status TEXT DEFAULT 'received', progress_notes TEXT, test_result TEXT, outcome TEXT, received_at INTEGER, expected_date TEXT, price REAL DEFAULT 0, discount REAL DEFAULT 0, created_by INTEGER, updated_at INTEGER, closed_at INTEGER);
-CREATE TABLE IF NOT EXISTS repair_events(id INTEGER PRIMARY KEY AUTOINCREMENT, repair_id INTEGER, status TEXT, note TEXT, user_id INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS repair_parts(id INTEGER PRIMARY KEY AUTOINCREMENT, repair_id INTEGER, product_id INTEGER, lot_id INTEGER, store_id INTEGER, qty INTEGER, unit_cost REAL, unit_price REAL, user_id INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS repair_payments(id INTEGER PRIMARY KEY AUTOINCREMENT, repair_id INTEGER, amount REAL, method TEXT, date TEXT, user_id INTEGER, note TEXT);
-CREATE TABLE IF NOT EXISTS appleids(id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER, customer_name TEXT, phone TEXT, model TEXT, apple_id TEXT, pw_enc TEXT, description TEXT, date TEXT, created_by INTEGER, hidden INTEGER DEFAULT 0, status TEXT DEFAULT 'request', request_date TEXT, expected_date TEXT, assigned_to INTEGER, notes TEXT, last_notified TEXT, updated_at INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS regional(id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER, customer_name TEXT, phone TEXT, device TEXT, problem TEXT, region TEXT, sent_to TEXT, date_sent TEXT, technician TEXT, parts TEXT, cost REAL DEFAULT 0, status TEXT DEFAULT 'received', expected_return TEXT, actual_return TEXT, notes TEXT, created_by INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS portal_accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER, name TEXT, phone TEXT, email TEXT UNIQUE COLLATE NOCASE, password TEXT, status TEXT DEFAULT 'pending', created_at INTEGER, last_login INTEGER, approved_by INTEGER);
-CREATE TABLE IF NOT EXISTS login_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT, ts INTEGER);
-CREATE TABLE IF NOT EXISTS soft_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, customer_id INTEGER NOT NULL, device TEXT, imei TEXT, problem TEXT, diagnosis TEXT, apple_id TEXT, lock_info TEXT, technician_id INTEGER, status TEXT, progress_notes TEXT, test_result TEXT, notes TEXT, tools TEXT, request_date TEXT, expected_date TEXT, account_date TEXT, price REAL DEFAULT 0, discount REAL DEFAULT 0, created_by INTEGER, received_at INTEGER, updated_at INTEGER, closed_at INTEGER, last_notified TEXT);
-CREATE INDEX IF NOT EXISTS ix_soft_cust ON soft_jobs(customer_id);
-CREATE TABLE IF NOT EXISTS soft_events(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, status TEXT, note TEXT, user_id INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS soft_parts(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, product_id INTEGER, lot_id INTEGER, store_id INTEGER, qty INTEGER, unit_cost REAL, unit_price REAL, user_id INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS soft_payments(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, amount REAL, method TEXT, date TEXT, user_id INTEGER, note TEXT);
-CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, kind TEXT NOT NULL, uid INTEGER NOT NULL, remember INTEGER DEFAULT 0, created INTEGER, last INTEGER);
-CREATE TABLE IF NOT EXISTS cust_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL, type TEXT, message TEXT, ref TEXT, is_read INTEGER DEFAULT 0, ts INTEGER);
-CREATE INDEX IF NOT EXISTS ix_cmsg ON cust_msgs(customer_id, is_read);
-CREATE TABLE IF NOT EXISTS chat_convs(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, name TEXT, dkey TEXT UNIQUE, created_by INTEGER, created_at INTEGER);
-CREATE TABLE IF NOT EXISTS chat_members(conv_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role TEXT DEFAULT 'member', joined_at INTEGER, last_read_id INTEGER DEFAULT 0, PRIMARY KEY(conv_id,user_id));
-CREATE INDEX IF NOT EXISTS ix_cm_user ON chat_members(user_id);
-CREATE TABLE IF NOT EXISTS chat_msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id INTEGER NOT NULL, user_id INTEGER NOT NULL, body TEXT, reply_to INTEGER, att_kind TEXT, att_name TEXT, att_file TEXT, att_size INTEGER, ts INTEGER, deleted INTEGER DEFAULT 0, deleted_by INTEGER, deleted_ts INTEGER);
-CREATE INDEX IF NOT EXISTS ix_msg_conv ON chat_msgs(conv_id,id);
-CREATE TABLE IF NOT EXISTS backups(file TEXT PRIMARY KEY, kind TEXT, size INTEGER, ts INTEGER, user_id INTEGER, note TEXT, verified_ts INTEGER, verified_ok INTEGER);
-CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL DEFAULT 'inventory', sku TEXT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, category TEXT, unit TEXT DEFAULT 'pcs', sale_price REAL DEFAULT 0, cost REAL DEFAULT 0, qty REAL DEFAULT 0, reorder INTEGER DEFAULT 0, vendor_id INTEGER, description TEXT, active INTEGER DEFAULT 1, created_by INTEGER, created_at INTEGER, updated_at INTEGER);
-CREATE TABLE IF NOT EXISTS stock_moves(id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, date TEXT NOT NULL, ts INTEGER, qty REAL NOT NULL, unit_cost REAL, kind TEXT NOT NULL, ref_kind TEXT, ref_id INTEGER, user_id INTEGER, note TEXT, customer_id INTEGER, vendor_id INTEGER);
-CREATE INDEX IF NOT EXISTS ix_mv_item ON stock_moves(item_id, date);
-CREATE INDEX IF NOT EXISTS ix_mv_ref ON stock_moves(ref_kind, ref_id);
-CREATE TABLE IF NOT EXISTS vendors(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, contact TEXT, phone TEXT, email TEXT, address TEXT, notes TEXT, active INTEGER DEFAULT 1, created_at INTEGER);
-CREATE TABLE IF NOT EXISTS bills(id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT UNIQUE, vendor_id INTEGER NOT NULL, date TEXT NOT NULL, due_date TEXT, ref TEXT, status TEXT DEFAULT 'open', total REAL DEFAULT 0, paid REAL DEFAULT 0, notes TEXT, user_id INTEGER, ts INTEGER, updated_at INTEGER, void_reason TEXT, voided_at INTEGER, voided_by INTEGER);
-CREATE TABLE IF NOT EXISTS bill_lines(id INTEGER PRIMARY KEY AUTOINCREMENT, bill_id INTEGER NOT NULL, item_id INTEGER, description TEXT, qty REAL, cost REAL, amount REAL);
-CREATE TABLE IF NOT EXISTS vendor_payments(id INTEGER PRIMARY KEY AUTOINCREMENT, bill_id INTEGER, vendor_id INTEGER NOT NULL, date TEXT NOT NULL, amount REAL NOT NULL, method TEXT, ref TEXT, note TEXT, user_id INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS sdocs(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, number TEXT UNIQUE, status TEXT, customer_id INTEGER, customer_name TEXT, phone TEXT, date TEXT NOT NULL, due_date TEXT, terms TEXT, notes TEXT, subtotal REAL DEFAULT 0, discount REAL DEFAULT 0, tax_rate REAL DEFAULT 0, tax REAL DEFAULT 0, total REAL DEFAULT 0, paid REAL DEFAULT 0, cost REAL DEFAULT 0, quote_id INTEGER, invoice_id INTEGER, user_id INTEGER, created_at INTEGER, updated_at INTEGER, void_reason TEXT, voided_at INTEGER, voided_by INTEGER);
-CREATE INDEX IF NOT EXISTS ix_sdoc_cust ON sdocs(customer_id);
-CREATE INDEX IF NOT EXISTS ix_sdoc_date ON sdocs(kind, date);
-CREATE TABLE IF NOT EXISTS sdoc_lines(id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id INTEGER NOT NULL, item_id INTEGER, kind TEXT, description TEXT, qty REAL, rate REAL, amount REAL, unit_cost REAL DEFAULT 0);
-CREATE INDEX IF NOT EXISTS ix_sline_doc ON sdoc_lines(doc_id);
-CREATE TABLE IF NOT EXISTS cust_payments(id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id INTEGER NOT NULL, customer_id INTEGER, date TEXT NOT NULL, amount REAL NOT NULL, method TEXT, ref TEXT, note TEXT, user_id INTEGER, ts INTEGER);
-CREATE INDEX IF NOT EXISTS ix_cpay_doc ON cust_payments(doc_id);
-CREATE TABLE IF NOT EXISTS exp_categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, active INTEGER DEFAULT 1);
-CREATE TABLE IF NOT EXISTS expense_entries(id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, category_id INTEGER, payee TEXT, vendor_id INTEGER, amount REAL NOT NULL, method TEXT, ref TEXT, description TEXT, user_id INTEGER, ts INTEGER);
-CREATE INDEX IF NOT EXISTS ix_exp_date ON expense_entries(date);
-CREATE TABLE IF NOT EXISTS money_accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, type TEXT DEFAULT 'cash', number TEXT, opening_balance REAL DEFAULT 0, opening_date TEXT, notes TEXT, active INTEGER DEFAULT 1, created_at INTEGER);
-CREATE TABLE IF NOT EXISTS acc_transfers(id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, from_id INTEGER NOT NULL, to_id INTEGER NOT NULL, amount REAL NOT NULL, fee REAL DEFAULT 0, fee_expense_id INTEGER, ref TEXT, note TEXT, user_id INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS acc_moves(id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL, date TEXT NOT NULL, amount REAL NOT NULL, kind TEXT, ref TEXT, note TEXT, user_id INTEGER, ts INTEGER);
-"""
-OLD_ACCOUNT_TABLES = ['stores', 'products', 'lots', 'returns', 'store_payments', 'settlements', 'sales', 'sale_items', 'expenses', 'inv_tx', 'inv_settlements', 'services']
+@contextmanager
+def savepoint():
+    """Lets a statement fail without aborting the whole request transaction (PostgreSQL aborts a transaction on any error)."""
+    sp = in_tx()
+    if sp: q('SAVEPOINT hic_sp')
+    try: yield
+    except BaseException:
+        if sp: q('ROLLBACK TO SAVEPOINT hic_sp'); q('RELEASE SAVEPOINT hic_sp')
+        raise
+    else:
+        if sp: q('RELEASE SAVEPOINT hic_sp')
 
-def _try(sql):
-    try: q(sql)
-    except sqlite3.Error: pass
+def _try(sql: str, p=()) -> bool:
+    try:
+        with savepoint(): q(sql, p)
+        return True
+    except psycopg.Error: return False
+
+
+# SQLite-era column types map to: INTEGER -> BIGINT, REAL -> DOUBLE PRECISION. Columns that were TEXT COLLATE NOCASE UNIQUE get a
+# unique index on lower(column), and are looked up with lower(), so e-mail logins and item / store / category / account names
+# stay case-insensitive exactly as before (works on any PostgreSQL, no extension needed).
+# Every column that older versions added later with ALTER TABLE is part of the table definition here.
+SCHEMA = [
+    # local date / time helpers (Africa/Mogadishu, UTC+3) used instead of SQLite's date(ts,'unixepoch','localtime') and julianday()
+    f"CREATE OR REPLACE FUNCTION hic_ts(t BIGINT) RETURNS TIMESTAMP LANGUAGE sql IMMUTABLE AS $$ SELECT to_timestamp(t) AT TIME ZONE {PG_TZ} $$",
+    f"CREATE OR REPLACE FUNCTION hic_day(t BIGINT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$ SELECT to_char(to_timestamp(t) AT TIME ZONE {PG_TZ}, 'YYYY-MM-DD') $$",
+    f"CREATE OR REPLACE FUNCTION hic_days_until(d TEXT) RETURNS INTEGER LANGUAGE plpgsql STABLE AS $$ BEGIN RETURN d::date - (now() AT TIME ZONE {PG_TZ})::date; EXCEPTION WHEN others THEN RETURN NULL; END $$",
+    # a REAL shown as text the way SQLite did (1.0 -> '1.0', 2.5 -> '2.5'), for the item summaries on invoices and bills
+    "CREATE OR REPLACE FUNCTION hic_num(x DOUBLE PRECISION) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$ SELECT CASE WHEN x = trunc(x) AND abs(x) < 1e15 THEN CAST(CAST(x AS BIGINT) AS TEXT) || '.0' ELSE CAST(x AS TEXT) END $$",
+    'CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT)',
+    "CREATE TABLE IF NOT EXISTS users(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, password TEXT NOT NULL, position TEXT NOT NULL DEFAULT 'Technician', is_admin BIGINT DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', avatar TEXT, perms TEXT DEFAULT '{}', logged_in BIGINT DEFAULT 0, last_seen BIGINT DEFAULT 0, session_start BIGINT DEFAULT 0, created_at BIGINT, approved_by BIGINT, deactivated_at BIGINT, deactivated_by BIGINT, deactivate_reason TEXT, chat_perms TEXT, is_owner BIGINT DEFAULT 0)",
+    'CREATE TABLE IF NOT EXISTS activity(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, user_id BIGINT, action TEXT, entity TEXT, entity_id BIGINT, detail TEXT, ts BIGINT, ip TEXT)',
+    'CREATE INDEX IF NOT EXISTS ix_act_ts ON activity(ts)',
+    'CREATE INDEX IF NOT EXISTS ix_act_user ON activity(user_id)',
+    'CREATE TABLE IF NOT EXISTS notifications(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, user_id BIGINT, type TEXT, message TEXT, link TEXT, is_read BIGINT DEFAULT 0, ts BIGINT, ref TEXT)',
+    'CREATE INDEX IF NOT EXISTS ix_notif_user ON notifications(user_id, is_read)',
+    'CREATE INDEX IF NOT EXISTS ix_notif_ref ON notifications(ref)',
+    "CREATE TABLE IF NOT EXISTS customers(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, phone_key TEXT NOT NULL UNIQUE, email TEXT, gender TEXT, address TEXT, notes TEXT, created_by BIGINT, created_at BIGINT, position TEXT DEFAULT 'Regular')",
+    "CREATE TABLE IF NOT EXISTS followups(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, customer_id BIGINT NOT NULL, type TEXT, note TEXT, due_date TEXT, done BIGINT DEFAULT 0, ref_kind TEXT, ref_id BIGINT, created_by BIGINT, created_at BIGINT, done_at BIGINT, title TEXT, time TEXT, scheduled_at BIGINT, priority TEXT DEFAULT 'normal', repeat_rule TEXT DEFAULT 'none', snooze_until BIGINT, status TEXT DEFAULT 'open', source TEXT DEFAULT 'system', updated_at BIGINT)",
+    "CREATE TABLE IF NOT EXISTS repairs(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, customer_id BIGINT NOT NULL, device TEXT, imei TEXT, problem TEXT, diagnosis TEXT, diagnosis_notes TEXT, required_parts TEXT, technician_id BIGINT, status TEXT DEFAULT 'received', progress_notes TEXT, test_result TEXT, outcome TEXT, received_at BIGINT, expected_date TEXT, price DOUBLE PRECISION DEFAULT 0, discount DOUBLE PRECISION DEFAULT 0, created_by BIGINT, updated_at BIGINT, closed_at BIGINT)",
+    'CREATE INDEX IF NOT EXISTS ix_rep_cust ON repairs(customer_id)',
+    'CREATE TABLE IF NOT EXISTS repair_events(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, repair_id BIGINT, status TEXT, note TEXT, user_id BIGINT, ts BIGINT)',
+    'CREATE TABLE IF NOT EXISTS repair_parts(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, repair_id BIGINT, product_id BIGINT, lot_id BIGINT, store_id BIGINT, qty BIGINT, unit_cost DOUBLE PRECISION, unit_price DOUBLE PRECISION, user_id BIGINT, ts BIGINT)',
+    'CREATE TABLE IF NOT EXISTS repair_payments(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, repair_id BIGINT, amount DOUBLE PRECISION, method TEXT, date TEXT, user_id BIGINT, note TEXT, account_id BIGINT)',
+    "CREATE TABLE IF NOT EXISTS appleids(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, customer_id BIGINT, customer_name TEXT, phone TEXT, model TEXT, apple_id TEXT, pw_enc TEXT, description TEXT, date TEXT, created_by BIGINT, hidden BIGINT DEFAULT 0, status TEXT DEFAULT 'request', request_date TEXT, expected_date TEXT, assigned_to BIGINT, notes TEXT, last_notified TEXT, updated_at BIGINT, ts BIGINT)",
+    "CREATE TABLE IF NOT EXISTS regional(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, customer_id BIGINT, customer_name TEXT, phone TEXT, device TEXT, problem TEXT, region TEXT, sent_to TEXT, date_sent TEXT, technician TEXT, parts TEXT, cost DOUBLE PRECISION DEFAULT 0, status TEXT DEFAULT 'received', expected_return TEXT, actual_return TEXT, notes TEXT, created_by BIGINT, ts BIGINT)",
+    "CREATE TABLE IF NOT EXISTS portal_accounts(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, customer_id BIGINT, name TEXT, phone TEXT, email TEXT, password TEXT, status TEXT DEFAULT 'pending', created_at BIGINT, last_login BIGINT, approved_by BIGINT)",
+    'CREATE TABLE IF NOT EXISTS login_attempts(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, k TEXT, ts BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_login_k ON login_attempts(k, ts)',
+    'CREATE TABLE IF NOT EXISTS soft_jobs(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, kind TEXT NOT NULL, customer_id BIGINT NOT NULL, device TEXT, imei TEXT, problem TEXT, diagnosis TEXT, apple_id TEXT, lock_info TEXT, technician_id BIGINT, status TEXT, progress_notes TEXT, test_result TEXT, notes TEXT, tools TEXT, request_date TEXT, expected_date TEXT, account_date TEXT, price DOUBLE PRECISION DEFAULT 0, discount DOUBLE PRECISION DEFAULT 0, created_by BIGINT, received_at BIGINT, updated_at BIGINT, closed_at BIGINT, last_notified TEXT, serial TEXT, gmail_pw TEXT, apple_pw TEXT)',
+    'CREATE INDEX IF NOT EXISTS ix_soft_cust ON soft_jobs(customer_id)',
+    'CREATE TABLE IF NOT EXISTS soft_events(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, job_id BIGINT, status TEXT, note TEXT, user_id BIGINT, ts BIGINT)',
+    'CREATE TABLE IF NOT EXISTS soft_parts(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, job_id BIGINT, product_id BIGINT, lot_id BIGINT, store_id BIGINT, qty BIGINT, unit_cost DOUBLE PRECISION, unit_price DOUBLE PRECISION, user_id BIGINT, ts BIGINT)',
+    'CREATE TABLE IF NOT EXISTS soft_payments(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, job_id BIGINT, amount DOUBLE PRECISION, method TEXT, date TEXT, user_id BIGINT, note TEXT, account_id BIGINT)',
+    'CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, kind TEXT NOT NULL, uid BIGINT NOT NULL, remember BIGINT DEFAULT 0, created BIGINT, last BIGINT, ip TEXT, ua TEXT)',
+    'CREATE TABLE IF NOT EXISTS cust_msgs(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, customer_id BIGINT NOT NULL, type TEXT, message TEXT, ref TEXT, is_read BIGINT DEFAULT 0, ts BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_cmsg ON cust_msgs(customer_id, is_read)',
+    'CREATE TABLE IF NOT EXISTS chat_convs(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, kind TEXT NOT NULL, name TEXT, dkey TEXT UNIQUE, created_by BIGINT, created_at BIGINT)',
+    "CREATE TABLE IF NOT EXISTS chat_members(conv_id BIGINT NOT NULL, user_id BIGINT NOT NULL, role TEXT DEFAULT 'member', joined_at BIGINT, last_read_id BIGINT DEFAULT 0, PRIMARY KEY(conv_id,user_id))",
+    'CREATE INDEX IF NOT EXISTS ix_cm_user ON chat_members(user_id)',
+    'CREATE TABLE IF NOT EXISTS chat_msgs(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, conv_id BIGINT NOT NULL, user_id BIGINT NOT NULL, body TEXT, reply_to BIGINT, att_kind TEXT, att_name TEXT, att_file TEXT, att_size BIGINT, ts BIGINT, deleted BIGINT DEFAULT 0, deleted_by BIGINT, deleted_ts BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_msg_conv ON chat_msgs(conv_id,id)',
+    'CREATE TABLE IF NOT EXISTS backups(file TEXT PRIMARY KEY, kind TEXT, size BIGINT, ts BIGINT, user_id BIGINT, note TEXT, verified_ts BIGINT, verified_ok BIGINT)',
+    "CREATE TABLE IF NOT EXISTS items(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, type TEXT NOT NULL DEFAULT 'inventory', sku TEXT, name TEXT NOT NULL, category TEXT, unit TEXT DEFAULT 'pcs', sale_price DOUBLE PRECISION DEFAULT 0, cost DOUBLE PRECISION DEFAULT 0, qty DOUBLE PRECISION DEFAULT 0, reorder BIGINT DEFAULT 0, vendor_id BIGINT, description TEXT, active BIGINT DEFAULT 1, created_by BIGINT, created_at BIGINT, updated_at BIGINT)",
+    'CREATE TABLE IF NOT EXISTS stock_moves(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, item_id BIGINT NOT NULL, date TEXT NOT NULL, ts BIGINT, qty DOUBLE PRECISION NOT NULL, unit_cost DOUBLE PRECISION, kind TEXT NOT NULL, ref_kind TEXT, ref_id BIGINT, user_id BIGINT, note TEXT, customer_id BIGINT, vendor_id BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_mv_item ON stock_moves(item_id, date)',
+    'CREATE INDEX IF NOT EXISTS ix_mv_ref ON stock_moves(ref_kind, ref_id)',
+    'CREATE TABLE IF NOT EXISTS vendors(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, contact TEXT, phone TEXT, email TEXT, address TEXT, notes TEXT, active BIGINT DEFAULT 1, created_at BIGINT)',
+    "CREATE TABLE IF NOT EXISTS bills(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, number TEXT UNIQUE, vendor_id BIGINT NOT NULL, date TEXT NOT NULL, due_date TEXT, ref TEXT, status TEXT DEFAULT 'open', total DOUBLE PRECISION DEFAULT 0, paid DOUBLE PRECISION DEFAULT 0, notes TEXT, user_id BIGINT, ts BIGINT, updated_at BIGINT, void_reason TEXT, voided_at BIGINT, voided_by BIGINT)",
+    'CREATE TABLE IF NOT EXISTS bill_lines(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, bill_id BIGINT NOT NULL, item_id BIGINT, description TEXT, qty DOUBLE PRECISION, cost DOUBLE PRECISION, amount DOUBLE PRECISION)',
+    'CREATE TABLE IF NOT EXISTS vendor_payments(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, bill_id BIGINT, vendor_id BIGINT NOT NULL, date TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL, method TEXT, ref TEXT, note TEXT, user_id BIGINT, ts BIGINT, account_id BIGINT)',
+    'CREATE TABLE IF NOT EXISTS sdocs(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, kind TEXT NOT NULL, number TEXT UNIQUE, status TEXT, customer_id BIGINT, customer_name TEXT, phone TEXT, date TEXT NOT NULL, due_date TEXT, terms TEXT, notes TEXT, subtotal DOUBLE PRECISION DEFAULT 0, discount DOUBLE PRECISION DEFAULT 0, tax_rate DOUBLE PRECISION DEFAULT 0, tax DOUBLE PRECISION DEFAULT 0, total DOUBLE PRECISION DEFAULT 0, paid DOUBLE PRECISION DEFAULT 0, cost DOUBLE PRECISION DEFAULT 0, quote_id BIGINT, invoice_id BIGINT, user_id BIGINT, created_at BIGINT, updated_at BIGINT, void_reason TEXT, voided_at BIGINT, voided_by BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_sdoc_cust ON sdocs(customer_id)',
+    'CREATE INDEX IF NOT EXISTS ix_sdoc_date ON sdocs(kind, date)',
+    'CREATE TABLE IF NOT EXISTS sdoc_lines(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, doc_id BIGINT NOT NULL, item_id BIGINT, kind TEXT, description TEXT, qty DOUBLE PRECISION, rate DOUBLE PRECISION, amount DOUBLE PRECISION, unit_cost DOUBLE PRECISION DEFAULT 0)',
+    'CREATE INDEX IF NOT EXISTS ix_sline_doc ON sdoc_lines(doc_id)',
+    'CREATE TABLE IF NOT EXISTS cust_payments(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, doc_id BIGINT NOT NULL, customer_id BIGINT, date TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL, method TEXT, ref TEXT, note TEXT, user_id BIGINT, ts BIGINT, account_id BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_cpay_doc ON cust_payments(doc_id)',
+    'CREATE TABLE IF NOT EXISTS exp_categories(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, active BIGINT DEFAULT 1)',
+    'CREATE TABLE IF NOT EXISTS expense_entries(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, date TEXT NOT NULL, category_id BIGINT, payee TEXT, vendor_id BIGINT, amount DOUBLE PRECISION NOT NULL, method TEXT, ref TEXT, description TEXT, user_id BIGINT, ts BIGINT, account_id BIGINT)',
+    'CREATE INDEX IF NOT EXISTS ix_exp_date ON expense_entries(date)',
+    "CREATE TABLE IF NOT EXISTS money_accounts(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, name TEXT NOT NULL, type TEXT DEFAULT 'cash', number TEXT, opening_balance DOUBLE PRECISION DEFAULT 0, opening_date TEXT, notes TEXT, active BIGINT DEFAULT 1, created_at BIGINT)",
+    'CREATE TABLE IF NOT EXISTS acc_transfers(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, date TEXT NOT NULL, from_id BIGINT NOT NULL, to_id BIGINT NOT NULL, amount DOUBLE PRECISION NOT NULL, fee DOUBLE PRECISION DEFAULT 0, fee_expense_id BIGINT, ref TEXT, note TEXT, user_id BIGINT, ts BIGINT)',
+    'CREATE TABLE IF NOT EXISTS acc_moves(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, account_id BIGINT NOT NULL, date TEXT NOT NULL, amount DOUBLE PRECISION NOT NULL, kind TEXT, ref TEXT, note TEXT, user_id BIGINT, ts BIGINT)',
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email ON users(lower(email))',                   # case-insensitive unique (was COLLATE NOCASE)
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_portal_email ON portal_accounts(lower(email))',
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_items_name ON items(lower(name))',
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_vendors_name ON vendors(lower(name))',
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_expcat_name ON exp_categories(lower(name))',
+    'CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_name ON money_accounts(lower(name))',
+]
+TABLES = [m.group(1) for m in (re.match(r'CREATE TABLE IF NOT EXISTS (\w+)', x) for x in SCHEMA) if m]
 
 def schema() -> None:
-    for stmt in [x for x in SCHEMA.split(';\n') if x.strip()]: q(stmt)
+    for stmt in SCHEMA: q(stmt)
 
 def _flag(k: str) -> bool: return bool(val('SELECT 1 FROM settings WHERE k=?', (k,)))
-def _set_flag(k: str) -> None: q("INSERT INTO settings(k,v) VALUES(?, '1')", (k,))
+def _set_flag(k: str) -> None: q("INSERT INTO settings(k,v) VALUES(?, '1') ON CONFLICT(k) DO NOTHING", (k,))
 
 def migrate() -> None:
-    """One-time upgrades. Every step is idempotent, so a database made by the old PHP server upgrades safely too."""
+    """One-time upgrades. Every step is idempotent. A database moved over from SQLite already carries every flag, so
+    nothing here runs again for it; on a brand-new database these steps just fill in the defaults.
+    (The SQLite-only upgrades — old inventory ledger, ALTER TABLE columns, dropping the pre-accounting tables — are not needed:
+    PostgreSQL tables are created complete, and the old tables never exist here.)"""
     if not _flag('mig_software'):
         for u in rows("SELECT id,perms FROM users WHERE is_admin=0 AND position='Software'"):
             p = json.loads(u['perms'] or '{}') or {}
@@ -171,74 +293,29 @@ def migrate() -> None:
         _set_flag('mig_software')
     if not _flag('mig_phonekey'):
         for c in rows('SELECT id,phone FROM customers'):
-            try: q('UPDATE customers SET phone_key=? WHERE id=?', (phone_key(c['phone'] or ''), c['id']))
-            except sqlite3.Error: pass
+            _try('UPDATE customers SET phone_key=? WHERE id=?', (phone_key(c['phone'] or ''), c['id']))
         _set_flag('mig_phonekey')
     if not _flag('mig_v3'):
-        for sql in ['ALTER TABLE soft_jobs ADD COLUMN serial TEXT', 'ALTER TABLE soft_jobs ADD COLUMN gmail_pw TEXT', 'ALTER TABLE soft_jobs ADD COLUMN apple_pw TEXT']:
-            _try(sql)
         q("UPDATE soft_jobs SET status='in_progress' WHERE kind='repair' AND status='progress'")
         _set_flag('mig_v3')
-    if not _flag('mig_inv') and _has('lots'):                       # (old inventory — only for databases from before the accounting rebuild)
-        for sql in ['ALTER TABLE lots ADD COLUMN qty_used INTEGER DEFAULT 0', 'ALTER TABLE lots ADD COLUMN qty_transferred INTEGER DEFAULT 0', 'ALTER TABLE lots ADD COLUMN paid_amount REAL DEFAULT 0', 'ALTER TABLE lots ADD COLUMN notes TEXT',
-                    "ALTER TABLE lots ADD COLUMN source TEXT DEFAULT 'supplier'", 'ALTER TABLE lots ADD COLUMN origin_lot_id INTEGER',
-                    'ALTER TABLE lots ADD COLUMN qty_remaining INTEGER GENERATED ALWAYS AS (qty_received-qty_sold-qty_used-qty_returned-qty_transferred) VIRTUAL',
-                    'ALTER TABLE returns ADD COLUMN reason TEXT', "ALTER TABLE returns ADD COLUMN status TEXT DEFAULT 'returned'"]:
-            _try(sql)
-        if not row('SELECT 1 FROM inv_tx LIMIT 1'):   # rebuild the ledger from existing history (nothing is lost)
-            q("INSERT INTO inv_tx(type,product_id,store_id,lot_id,qty,unit_cost,user_id,ts,date,ref_kind,ref_id) SELECT 'RECEIVE',product_id,store_id,id,qty_received,cost,user_id,COALESCE(ts,strftime('%s','now')),date,'receiving',id FROM lots")
-            q("INSERT INTO inv_tx(type,product_id,store_id,lot_id,qty,unit_cost,unit_price,customer_id,user_id,ts,date,ref_kind,ref_id) SELECT 'SALE',si.product_id,si.store_id,si.lot_id,si.qty,si.unit_cost,si.unit_price,s.customer_id,s.user_id,COALESCE(s.ts,strftime('%s','now')),s.date,'sale',s.id FROM sale_items si JOIN sales s ON s.id=si.sale_id WHERE si.lot_id IS NOT NULL")
-            q("INSERT INTO inv_tx(type,product_id,store_id,lot_id,qty,unit_cost,user_id,ts,date,ref_kind,ref_id,note) SELECT 'REPAIR_USAGE',rp.product_id,rp.store_id,rp.lot_id,rp.qty,rp.unit_cost,rp.user_id,rp.ts,date(rp.ts,'unixepoch','localtime'),'repair_part',rp.id,'Hardware repair #'||rp.repair_id FROM repair_parts rp WHERE rp.lot_id IS NOT NULL")
-            q("INSERT INTO inv_tx(type,product_id,store_id,lot_id,qty,unit_cost,user_id,ts,date,ref_kind,ref_id,note) SELECT 'REPAIR_USAGE',sp.product_id,sp.store_id,sp.lot_id,sp.qty,sp.unit_cost,sp.user_id,sp.ts,date(sp.ts,'unixepoch','localtime'),'soft_part',sp.id,'Software service #'||sp.job_id FROM soft_parts sp WHERE sp.lot_id IS NOT NULL")
-            q("INSERT INTO inv_tx(type,product_id,store_id,lot_id,qty,unit_cost,user_id,ts,date,ref_kind,ref_id,reason) SELECT 'RETURN',l.product_id,l.store_id,r.lot_id,r.qty,l.cost,r.user_id,COALESCE(strftime('%s',r.date),strftime('%s','now')),r.date,'return',r.id,'Unsold — returned to supplier' FROM returns r JOIN lots l ON l.id=r.lot_id")
-            q("UPDATE lots SET qty_sold=(SELECT COALESCE(SUM(qty),0) FROM inv_tx WHERE lot_id=lots.id AND type='SALE' AND voided=0), qty_used=(SELECT COALESCE(SUM(qty),0) FROM inv_tx WHERE lot_id=lots.id AND type='REPAIR_USAGE' AND voided=0), qty_returned=(SELECT COALESCE(SUM(qty),0) FROM inv_tx WHERE lot_id=lots.id AND type='RETURN' AND voided=0), qty_transferred=0")
-            q("UPDATE lots SET paid_amount=qty_received*cost WHERE type='cash'")
-            q("INSERT OR IGNORE INTO inv_settlements(store_id,date,status,received,sold,returned,day_profit,payable,discrepancy,closed_by,finished_at,ts,detail) SELECT 0,date,'finished',received,sold,returned,profit,MAX(0,payable-paid),0,user_id,ts,ts,detail FROM settlements")
-        _set_flag('mig_inv')
-    if not _flag('mig_text'):   # repair mojibake left by an old patch
-        _try("UPDATE inv_tx SET reason='Unsold — returned to supplier' WHERE reason LIKE 'Unsold â%'")
-        _set_flag('mig_text')
-    if not _flag('mig_v4'):   # deactivation time / reason, customer position
-        for sql in ['ALTER TABLE users ADD COLUMN deactivated_at INTEGER', 'ALTER TABLE users ADD COLUMN deactivated_by INTEGER', 'ALTER TABLE users ADD COLUMN deactivate_reason TEXT',
-                    "ALTER TABLE customers ADD COLUMN position TEXT DEFAULT 'Regular'"]:
-            _try(sql)
-        _set_flag('mig_v4')
-    if not _flag('mig_v5'):   # security / audit / documents / customer messages
-        for sql in ['ALTER TABLE sessions ADD COLUMN ip TEXT', 'ALTER TABLE sessions ADD COLUMN ua TEXT', 'ALTER TABLE activity ADD COLUMN ip TEXT']: _try(sql)
-        _set_flag('mig_v5')
-    if not _flag('mig_v6'):   # internal chat permissions
-        _try('ALTER TABLE users ADD COLUMN chat_perms TEXT')
-        _set_flag('mig_v6')
+    for k in ('mig_inv', 'mig_text', 'mig_v4', 'mig_v5', 'mig_v6'): _set_flag(k)    # SQLite-only steps (see above)
     if not _flag('mig_v7'):   # customer-linked reminders (extends the existing follow-up/reminder table — no new system)
-        for sql in ["ALTER TABLE followups ADD COLUMN title TEXT", "ALTER TABLE followups ADD COLUMN time TEXT", "ALTER TABLE followups ADD COLUMN scheduled_at INTEGER",
-                    "ALTER TABLE followups ADD COLUMN priority TEXT DEFAULT 'normal'", "ALTER TABLE followups ADD COLUMN repeat_rule TEXT DEFAULT 'none'", "ALTER TABLE followups ADD COLUMN snooze_until INTEGER",
-                    "ALTER TABLE followups ADD COLUMN status TEXT DEFAULT 'open'", "ALTER TABLE followups ADD COLUMN source TEXT DEFAULT 'system'", "ALTER TABLE followups ADD COLUMN updated_at INTEGER"]:
-            _try(sql)
         q("UPDATE followups SET status='done' WHERE done=1 AND (status IS NULL OR status='open')")
         _set_flag('mig_v7')
     if not _flag('mig_v8'):   # System Owner: one account above the Super Admins (the first Super Admin becomes the owner)
-        _try('ALTER TABLE users ADD COLUMN is_owner INTEGER DEFAULT 0')
         if not val('SELECT 1 FROM users WHERE is_owner=1'):
             oid = val("SELECT MIN(id) FROM users WHERE is_admin=1 AND status='active'") or val('SELECT MIN(id) FROM users WHERE is_admin=1')
             if oid: q("UPDATE users SET is_owner=1, position='System Owner' WHERE id=?", (oid,))
         _set_flag('mig_v8')
-    if not _flag('mig_v9'):   # QuickBooks-style accounting replaces the old sales / expenses / stores / inventory (old tables and their data are removed)
-        if _has('services'):                                         # keep the service price list as service items
-            for sv in rows('SELECT name,price,active FROM services'):
-                if not val('SELECT 1 FROM items WHERE name=?', (sv['name'],)):
-                    q("INSERT INTO items(type,name,category,sale_price,active,created_at) VALUES('service',?,'Services',?,?,?)", (sv['name'], sv['price'] or 0, 1 if sv['active'] else 0, now()))
-        for t in OLD_ACCOUNT_TABLES: _try(f'DROP TABLE IF EXISTS {t}')
-        q('DELETE FROM repair_parts'); q('DELETE FROM soft_parts')      # they pointed at the removed products
+    if not _flag('mig_v9'):   # QuickBooks-style accounting: starter service items and expense categories
         if not row("SELECT 1 FROM items WHERE type='service'"):
             for nm, pr in [('Apple Unlock', 30), ('New Apple ID', 10), ('Software Repair', 20), ('iOS Restore', 10), ('Account Service', 15), ('Screen replacement (labour)', 0)]:
                 q("INSERT INTO items(type,name,category,sale_price,created_at) VALUES('service',?,'Services',?,?)", (nm, pr, now()))
         if not row('SELECT 1 FROM exp_categories'):
             from acc import DEFAULT_EXP_CATS
             for nm in DEFAULT_EXP_CATS: q('INSERT INTO exp_categories(name) VALUES(?)', (nm,))
-        for k in ('seq_invoice', 'seq_quote', 'seq_bill'): q('DELETE FROM settings WHERE k=?', (k,))
         _set_flag('mig_v9')
     if not _flag('mig_v10'):  # money accounts (created by the user): every payment in or out lands in an account
-        for t in ('cust_payments', 'vendor_payments', 'expense_entries', 'repair_payments', 'soft_payments'): _try(f'ALTER TABLE {t} ADD COLUMN account_id INTEGER')
         from acc import METHOD_ACCOUNT
         ids = {r['name'].lower(): r['id'] for r in rows('SELECT id,name FROM money_accounts')}
         cash = ids.get('cash') or (min(ids.values()) if ids else None)
@@ -248,13 +325,13 @@ def migrate() -> None:
                 q(f"UPDATE {t} SET account_id=? WHERE account_id IS NULL AND COALESCE(method,'')=?", (aid, m['method'] or ''))
         _set_flag('mig_v10')
     if not _flag('mig_v11'):  # accounts are defined by the user: remove the four starter accounts if they were never touched
-        for a in rows("SELECT id FROM money_accounts WHERE name IN ('Cash','ZAAD','eDahab','Bank') AND COALESCE(opening_balance,0)=0 AND COALESCE(number,'')='' AND COALESCE(notes,'')=''"):
+        for a in rows("SELECT id FROM money_accounts WHERE lower(name) IN ('cash','zaad','edahab','bank') AND COALESCE(opening_balance,0)=0 AND COALESCE(number,'')='' AND COALESCE(notes,'')=''"):
             if val('SELECT 1 FROM acc_transfers WHERE from_id=? OR to_id=?', (a['id'], a['id'])) or val('SELECT 1 FROM acc_moves WHERE account_id=?', (a['id'],)): continue
             for t in ('cust_payments', 'vendor_payments', 'expense_entries', 'repair_payments', 'soft_payments'): q(f'UPDATE {t} SET account_id=NULL WHERE account_id=?', (a['id'],))
             q('DELETE FROM money_accounts WHERE id=?', (a['id'],))
         _set_flag('mig_v11')
 
-def _has(table: str) -> bool: return bool(val("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)))
+def _has(table: str) -> bool: return bool(val("SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=?", (table,)))
 
 
 def default_perms(position: str) -> dict:
@@ -266,48 +343,28 @@ def seed() -> None:
     q("INSERT INTO users(name,email,password,position,is_admin,status,perms,created_at) VALUES(?,?,?,?,1,?,?,?)", ('Super Admin', 'admin@hic.so', hash_pw('Admin@123'), 'Super Admin', 'active', '{}', now()))
     for k, v in {'company_name': 'HARGEISA IPHONE CENTER', 'slogan': 'Hubsiimo iyo Degdegsiimo', 'phone': '+252 63 0000000', 'email': 'info@hargeisaiphonecenter.com', 'address': 'Hargeisa, Somaliland',
                  'website': 'www.hargeisaiphonecenter.com', 'social': 'Facebook / Instagram / TikTok: @hargeisaiphonecenter', 'footer': '© HARGEISA IPHONE CENTER — Hubsiimo iyo Degdegsiimo', 'logo': '', 'currency': '$'}.items():
-        q('INSERT INTO settings(k,v) VALUES(?,?)', (k, v))
+        q('INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO NOTHING', (k, v))
 
-def _copy_missing_files(source: str, destination: str) -> None:
-    os.makedirs(destination, exist_ok=True)
-    for name in os.listdir(source):
-        src, dst = os.path.join(source, name), os.path.join(destination, name)
-        if os.path.isdir(src):
-            _copy_missing_files(src, dst)
-        elif not name.endswith(('-shm', '-wal')) and not os.path.exists(dst):
-            shutil.copy2(src, dst)
+INIT_LOCK = 72_001_001                                           # advisory lock id: only one server process sets up the database at a time
 
-
-def prepare_data_dir() -> None:
-    """Seed a new persistent data volume from the bundled data snapshot once."""
-    source_data = os.path.abspath(os.path.join(ROOT, 'data'))
-    if DATA == source_data or os.path.exists(DB_FILE): return
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-    source_db = os.path.join(source_data, 'hic.sqlite')
-    if os.path.isfile(source_db): shutil.copy2(source_db, DB_FILE)
-    for name in ('app.key', 'backups', 'chat_files'):
-        source, destination = os.path.join(source_data, name), os.path.join(DATA, name)
-        if os.path.isdir(source): _copy_missing_files(source, destination)
-        elif os.path.isfile(source) and not os.path.exists(destination):
-            shutil.copy2(source, destination)
-
+def setup(fresh_seed: bool = True) -> None:
+    """Create / upgrade the tables inside the current transaction (also used after a restore and by the SQLite import)."""
+    q('SELECT pg_advisory_xact_lock(?)', (INIT_LOCK,))
+    schema()
+    if fresh_seed and not val('SELECT 1 FROM users LIMIT 1'): seed()   # brand-new, empty database
+    migrate()
 
 def init_db() -> None:
     """Create / upgrade the database once at start-up."""
-    prepare_data_dir()
-    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-    fresh = not os.path.exists(DB_FILE)
-    c = sqlite3.connect(DB_FILE, isolation_level=None, timeout=8)
-    c.row_factory = lambda cur, r: {col[0]: r[i] for i, col in enumerate(cur.description)}
-    c.execute('PRAGMA journal_mode=WAL')
     from flask import Flask
-    app = Flask('init')
-    with app.app_context():
-        g.db = c
-        schema()
-        if fresh: seed()
-        q('BEGIN IMMEDIATE'); migrate(); q('COMMIT')
-    c.close()
+    app = Flask('init'); c = pool().getconn()
+    try:
+        with app.app_context():
+            g.db = c
+            q('BEGIN')
+            try: setup(); q('COMMIT')
+            except BaseException: q('ROLLBACK'); raise
+    finally: release(c)
 
 
 # ------------------------------------------------------------------ settings & crypto
@@ -487,13 +544,13 @@ def notify(type_: str, msg: str, aud='admin', link=None, ref=None) -> None:
     if ref and val('SELECT 1 FROM notifications WHERE ref=?', (ref,)): return
     if isinstance(aud, int): ids = [aud]
     elif isinstance(aud, list): ids = aud
-    elif aud == 'all': ids = [r['id'] for r in rows("SELECT id FROM users WHERE status='active'")]
+    elif aud == 'all': ids = [r['id'] for r in rows("SELECT id FROM users WHERE status='active' ORDER BY id")]
     elif isinstance(aud, str) and aud.startswith('perm:'):
         mod = aud[5:]; ids = []
-        for r in rows("SELECT id,is_admin,perms FROM users WHERE status='active'"):
+        for r in rows("SELECT id,is_admin,perms FROM users WHERE status='active' ORDER BY id"):
             p = json.loads(r['perms'] or '{}') or {}
             if r['is_admin'] or mod in p: ids.append(r['id'])
-    else: ids = [r['id'] for r in rows("SELECT id FROM users WHERE status='active' AND is_admin=1")]
+    else: ids = [r['id'] for r in rows("SELECT id FROM users WHERE status='active' AND is_admin=1 ORDER BY id")]
     for i in unique(ids): q('INSERT INTO notifications(user_id,type,message,link,ts,ref) VALUES(?,?,?,?,?,?)', (i, type_, msg, link, now(), ref))
 
 
@@ -528,8 +585,8 @@ def money_by_day(frm: str, to: str) -> dict:
     # cost: cost of goods sold + parts used + stock adjustments (from the stock ledger) + cost of non-stock items sold
     add(rows("SELECT date d, SUM(-qty*unit_cost) v FROM stock_moves WHERE kind IN ('sale','repair','adjust') AND date BETWEEN ? AND ? GROUP BY date", (frm, to)), 'cost')
     add(rows("SELECT x.date d, SUM(l.qty*l.unit_cost) v FROM sdoc_lines l JOIN sdocs x ON x.id=l.doc_id WHERE x.kind IN ('invoice','receipt') AND x.status<>'void' AND l.kind='non_inventory' AND x.date BETWEEN ? AND ? GROUP BY x.date", (frm, to)), 'cost')
-    add(rows("SELECT date(p.ts,'unixepoch','localtime') d, SUM(p.qty*p.unit_cost) v FROM repair_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND date(p.ts,'unixepoch','localtime') BETWEEN ? AND ? GROUP BY d", (frm, to)), 'cost')
-    add(rows("SELECT date(p.ts,'unixepoch','localtime') d, SUM(p.qty*p.unit_cost) v FROM soft_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND date(p.ts,'unixepoch','localtime') BETWEEN ? AND ? GROUP BY d", (frm, to)), 'cost')
+    add(rows("SELECT hic_day(p.ts) d, SUM(p.qty*p.unit_cost) v FROM repair_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND hic_day(p.ts) BETWEEN ? AND ? GROUP BY hic_day(p.ts)", (frm, to)), 'cost')
+    add(rows("SELECT hic_day(p.ts) d, SUM(p.qty*p.unit_cost) v FROM soft_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND hic_day(p.ts) BETWEEN ? AND ? GROUP BY hic_day(p.ts)", (frm, to)), 'cost')
     add(rows('SELECT date d, SUM(amount) v FROM expense_entries WHERE date BETWEEN ? AND ? GROUP BY date', (frm, to)), 'expense')
     return m
 
@@ -545,8 +602,8 @@ def finance_breakdown(frm: str, to: str) -> dict:
          'software_charges': sv('SELECT COALESCE(SUM(amount),0) FROM soft_payments WHERE date BETWEEN ? AND ?', (frm, to)),
          'product_costs': sv("SELECT COALESCE(SUM(-qty*unit_cost),0) FROM stock_moves WHERE kind='sale' AND date BETWEEN ? AND ?", (frm, to)) + sv(f"SELECT COALESCE(SUM(l.qty*l.unit_cost),0) {inv} AND l.kind='non_inventory'", (frm, to)),
          'parts_costs': sv("SELECT COALESCE(SUM(-qty*unit_cost),0) FROM stock_moves WHERE kind='repair' AND date BETWEEN ? AND ?", (frm, to))
-                        + sv("SELECT COALESCE(SUM(p.qty*p.unit_cost),0) FROM repair_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND date(p.ts,'unixepoch','localtime') BETWEEN ? AND ?", (frm, to))
-                        + sv("SELECT COALESCE(SUM(p.qty*p.unit_cost),0) FROM soft_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND date(p.ts,'unixepoch','localtime') BETWEEN ? AND ?", (frm, to)),
+                        + sv("SELECT COALESCE(SUM(p.qty*p.unit_cost),0) FROM repair_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND hic_day(p.ts) BETWEEN ? AND ?", (frm, to))
+                        + sv("SELECT COALESCE(SUM(p.qty*p.unit_cost),0) FROM soft_parts p JOIN items i ON i.id=p.product_id WHERE i.type<>'inventory' AND hic_day(p.ts) BETWEEN ? AND ?", (frm, to)),
          'adjustments': sv("SELECT COALESCE(SUM(-qty*unit_cost),0) FROM stock_moves WHERE kind='adjust' AND date BETWEEN ? AND ?", (frm, to)),
          'expenses': sv('SELECT COALESCE(SUM(amount),0) FROM expense_entries WHERE date BETWEEN ? AND ?', (frm, to))}
     b['service_charges'] = rnd(b['hardware_charges'] + b['software_charges'])
@@ -565,7 +622,10 @@ def _when(expected: str) -> str:
 def run_checks() -> None:
     t = now()
     if t - I(setting('last_check', '0')) < 50: return
-    set_setting('last_check', str(t)); td = today(); tomorrow = add_days(1).strftime('%Y-%m-%d')
+    # claim this run atomically: requests run in parallel on PostgreSQL, and only one of them may send the alerts
+    if not val("INSERT INTO settings(k,v) VALUES('last_check',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v "
+               "WHERE (CASE WHEN settings.v ~ '^[0-9]+$' THEN CAST(settings.v AS BIGINT) ELSE 0 END) <= ? RETURNING k", (str(t), t - 50)): return
+    td = today(); tomorrow = add_days(1).strftime('%Y-%m-%d')
     admins = lambda: [r['id'] for r in rows("SELECT id FROM users WHERE status='active' AND is_admin=1")]
     for a in rows("SELECT * FROM appleids WHERE status IN ('request','received','progress') AND expected_date IS NOT NULL AND expected_date<=? AND COALESCE(last_notified,'')<>?", (tomorrow, td)):
         ids = admins() + ([int(a['assigned_to'])] if a['assigned_to'] else [])
@@ -584,10 +644,12 @@ def run_checks() -> None:
         eff = int(f['snooze_until'] or f['scheduled_at']); label = f['title'] or str(f['type'] or 'Reminder').replace('_', ' ').capitalize()
         when = 'Today' if fdate(eff, '%Y-%m-%d') == td else fdate(eff, '%d %b')
         notify('reminder', f"Customer Reminder — {f['cname']}: {label} ({when}, {fdate(eff, '%H:%M')})", 'perm:customers', f"#/customers/{f['customer_id']}", f"rem:{f['id']}:{eff}")
-    try: smart_checks(td)
+    try:
+        with savepoint(): smart_checks(td)
     except Exception: pass          # alerts must never break the heartbeat
     try:
-        import h_chat; h_chat.purge_if_due(td)
+        import h_chat
+        with savepoint(): h_chat.purge_if_due(td)
     except Exception: pass
 
 
@@ -609,7 +671,7 @@ def smart_checks(td: str) -> None:
     n_wait = int(val("SELECT COUNT(*) FROM repairs WHERE status IN ('ready','completed') AND COALESCE(updated_at,0)<?", (t - 3 * 86400,)) or 0)
     if n_wait: notify('ready_wait', f'{n_wait} finished device(s) have been waiting for the customer for over 3 days.', 'perm:repairs', '#/repairs', f'readywait:{td}')
     unpaid = row(f"SELECT COUNT(*) n, COALESCE(SUM(b),0) s FROM (SELECT {BAL_REPAIR} b FROM repairs r WHERE r.status IN ('ready','completed','took_completed','took_incomplete') AND COALESCE(r.updated_at,0)<? "
-                 f"UNION ALL SELECT {BAL_SOFT} b FROM soft_jobs j WHERE j.status IN ('completed','verified','took','instore','customer_received') AND COALESCE(j.updated_at,0)<?) WHERE b>0.005", (t - 7 * 86400, t - 7 * 86400))
+                 f"UNION ALL SELECT {BAL_SOFT} b FROM soft_jobs j WHERE j.status IN ('completed','verified','took','instore','customer_received') AND COALESCE(j.updated_at,0)<?) x WHERE b>0.005", (t - 7 * 86400, t - 7 * 86400))
     if unpaid and unpaid['n']: notify('unpaid', f"{unpaid['n']} finished job(s) still have an unpaid balance older than 7 days (total {round(float(unpaid['s']), 2)}).", 'admin', '#/customers', f'unpaid:{td}')
     od = row("SELECT COUNT(*) n, COALESCE(SUM(total-paid),0) s FROM sdocs WHERE kind='invoice' AND status='open' AND due_date IS NOT NULL AND due_date<?", (td,))
     if od and od['n']: notify('overdue', f"{od['n']} invoice(s) are overdue (total due {round(float(od['s']), 2)}).", 'perm:sales', '#/invoices', f'odinv:{td}')

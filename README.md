@@ -3,26 +3,52 @@
 Repair management + customers + software services + Apple ID + inventory/stores + sales & services + expenses + finance +
 users + notifications + regional repairs + customer portal.
 
-**Backend: Python 3 (Flask + waitress + SQLite).** The front end, the database and every saved record are unchanged from the earlier PHP version.
+**Backend: Python 3 (Flask + waitress + PostgreSQL on Neon).** The front end, the API and every saved record are unchanged; the data moved
+from `data\hic.sqlite` to PostgreSQL (the SQLite file is kept untouched as an archive).
 
 ## Run it
-1. Double-click **START-SYSTEM.bat** (it installs the few required packages the first time).
-2. Staff system: <http://localhost:8080> — Customer portal: <http://localhost:8080/portal>
-3. From phones/tablets on the same Wi-Fi use the PC's IP: `http://192.168.x.x:8080`
-4. Default login: `admin@hic.so` / `Admin@123` → change it in **My Profile** straight away.
+1. Set `DATABASE_URL` once (see *Database* below).
+2. Double-click **START-SYSTEM.bat** (it installs the few required packages the first time).
+3. Staff system: <http://localhost:8080> — Customer portal: <http://localhost:8080/portal>
+4. From phones/tablets on the same Wi-Fi use the PC's IP: `http://192.168.x.x:8080`
+5. Default login on a brand-new, empty database: `admin@hic.so` / `Admin@123` → change it in **My Profile** straight away.
 
 First-time setup on a new PC: `winget install -e --id Python.Python.3.12`, then run START-SYSTEM.bat.
-Optional environment variables: `HIC_HOST` (default `0.0.0.0`; use `127.0.0.1` for this-PC-only), `HIC_PORT` (default `8080`), `HIC_DB` (database path).
+Environment variables: `DATABASE_URL` (**required** — the PostgreSQL / Neon connection string), `HIC_HOST` (default `0.0.0.0`; use `127.0.0.1`
+for this-PC-only), `HIC_PORT` (default `8080`), `HIC_DATA_DIR` (folder for `app.key`, backups and chat files; default `data`), `HIC_DB_POOL`
+(database connections kept open, default 12).
 
-## Deploy with persistent storage
-Vercel's serverless filesystem is read-only for deployed files and its `/tmp` storage is temporary, so it cannot safely host this SQLite-backed business system. The included `render.yaml` configures a Render web service with a persistent disk mounted at `/var/data`. On the disk's first start, the app copies the bundled database, encryption key, backups and chat files if no database exists there; subsequent starts keep using the disk's data. Keep the disk attached and maintain separate backups.
+## Database: PostgreSQL (Neon)
+The connection string is **never** stored in the source code. The server reads it from the `DATABASE_URL` environment variable, or —
+if that is not set — from a file named `.env` in the project folder (git-ignored; see `.env.example`):
+
+    DATABASE_URL=postgresql://USER:PASSWORD@HOST/neondb?sslmode=require&channel_binding=require
+
+Python packages (in `requirements.txt`, installed by START-SYSTEM.bat): `psycopg[binary]` (PostgreSQL driver, includes its own libpq —
+nothing else to install on Windows) and `psycopg-pool` (keeps connections to Neon open between requests).
+
+**Moving the old SQLite data into PostgreSQL (one time):**
+1. Stop the server (close its window) so nothing new is written to SQLite.
+2. `python -m pip install -r requirements.txt`
+3. Set `DATABASE_URL` (or create `.env`).
+4. `python server\migrate_sqlite_to_pg.py`
+   It copies `data\hic.sqlite` to a temporary folder and reads only the copy (your file is never opened for writing), creates the
+   tables, copies every row with the same ids in ONE transaction, compares the row count of every table and only then commits.
+   If PostgreSQL already holds business data it stops; add `--replace` to overwrite it. `--sqlite PATH` imports another file.
+5. Start the server with START-SYSTEM.bat and sign in with your usual account.
+
+Notes: `data\app.key` still decrypts the Apple ID passwords, and chat attachments stay in `data\chat_files` — keep both.
+Dates in SQL use Hargeisa time (UTC+3) everywhere. Neon suspends an idle database after a few minutes; the first request after that takes
+a second or two. Host the server close to the Neon region (or choose a Neon region close to the server) — every page makes several queries.
+
 
 ## Layout
 - `server/` — Python backend: `app.py` (web server + API dispatcher), `core.py` (database, sessions, security, finance totals),
   `acc.py` (items & stock, stores & bills, quotations & invoices, payments, expenses), `h_reports.py` (all reports),
-  `h_auth.py`, `h_ops.py`, `h_inv.py` (finance + customer portal), `h_soft.py`, `h_center.py`, `h_chat.py`, `h_owner.py` (API handlers)
+  `h_auth.py`, `h_ops.py`, `h_inv.py` (finance + customer portal), `h_soft.py`, `h_center.py`, `h_chat.py`, `h_owner.py` (API handlers),
+  `pgsync.py` (PostgreSQL ⇄ SQLite copy for backups / restore), `migrate_sqlite_to_pg.py` (one-time move of `hic.sqlite`)
 - `public/` — the browser apps (`index.html` staff, `portal.html` customers, `assets/`)
-- `data/` — `hic.sqlite` (database) and `app.key` (encryption key) — **back up both files together**
+- `data/` — `app.key` (encryption key — **keep it with your backups**), `backups/`, `chat_files/`, and the old `hic.sqlite` (archive, no longer used)
 - `legacy_php/` — the previous PHP backend, kept only as a rollback copy
 
 ## Security model (enforced in Python, not just hidden in the UI)
@@ -64,7 +90,8 @@ data is `data\backups\hic_auto_20260925_094238.sqlite`). Restoring any older bac
 - Settings → Invoices & documents: invoice / quotation prefixes, default tax %, payment terms, quotation validity.
 
 ## Reset to a clean database
-Close the server, run **RESET-DATABASE.bat** and type YES.
+The data is in PostgreSQL now, so RESET-DATABASE.bat no longer deletes anything. To start clean, create a new empty Neon database
+(or branch), point `DATABASE_URL` at it and start the server — the tables and the default admin are created automatically.
 
 ## Roll back to PHP (only if ever needed)
 Move `legacy_php/app` back to `app/`, `legacy_php/router.php` to the project root and `legacy_php/api.php` to `public/`, then run
@@ -73,8 +100,10 @@ understands the database — it only works with a backup made before that date.
 
 ## System Center (Super Admin)
 Sidebar → **System Center**: Management Analytics, Employee Activity, Advanced Audit Log, Security & Permissions, Backup & Restore, Data Recovery, System Health.
-- **Backups** are saved in `data\backups\` (automatic daily + manual). Copy that folder — and `data\app.key` — to a USB drive regularly.
-  Restore from the app (Backup & Restore → Restore) or manually: copy a backup over `data\hic.sqlite` with the server stopped.
+- **Backups** are saved in `data\backups\` (automatic daily + manual) as complete SQLite snapshots of the PostgreSQL data. Copy that
+  folder — and `data\app.key` — to a USB drive regularly. Restore from the app (Backup & Restore → Restore; it runs in one transaction and
+  takes a safety copy first) or manually with the server stopped: `python server\migrate_sqlite_to_pg.py --sqlite data\backups\FILE --replace`.
+  Neon also keeps its own point-in-time history (Neon console → Restore).
 - **Documents** (invoice, receipt, device slip, repair report) open the print dialog — choose *Save as PDF* for a PDF. Settings → Invoices & documents.
 - **Phone / PWA**: open the site on the phone → *Add to Home Screen* (install needs `https` or `localhost`; over plain Wi-Fi it still works as a normal site with a bottom menu).
 - **Customer portal**: customers enter with their registered number (first time needs approval) and see devices, billing, payment history and messages.

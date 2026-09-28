@@ -92,7 +92,7 @@ def pl_rows(bs: list, frm: str, to: str, extra_cols: list) -> list:
         for i, b in enumerate(bs): r[extra_cols[i]] = None if k is None else (-b[k] if style == '-' else b[k])
         out.append(r)
     out.append({'label': 'Expenses', 'style': 'h', **{c: None for c in extra_cols}})
-    cats = rows('SELECT DISTINCT c.id,c.name FROM expense_entries e JOIN exp_categories c ON c.id=e.category_id WHERE e.date BETWEEN ? AND ? ORDER BY c.name', (frm, to))
+    cats = rows('SELECT DISTINCT c.id,c.name,lower(c.name) sort_name FROM expense_entries e JOIN exp_categories c ON c.id=e.category_id WHERE e.date BETWEEN ? AND ? ORDER BY lower(c.name)', (frm, to))
     return out, cats
 
 def r_pl(f, adm):
@@ -128,8 +128,8 @@ def inv_filter(f, alias='x') -> tuple:
 
 def r_sales_customer(f, adm):
     w, p = inv_filter(f)
-    rs = rows(f"SELECT COALESCE(c.name,x.customer_name,'Walk-in customer') customer, c.phone, COUNT(*) invoices, SUM(x.total) total, SUM(x.paid) paid, SUM(x.total-x.paid) balance, SUM(x.total-x.tax-x.cost) profit "
-              f"FROM sdocs x LEFT JOIN customers c ON c.id=x.customer_id WHERE {w} GROUP BY COALESCE(CAST(x.customer_id AS TEXT), 'w:'||x.customer_name) ORDER BY total DESC", p)
+    rs = rows(f"SELECT MAX(COALESCE(c.name,x.customer_name,'Walk-in customer')) customer, MAX(c.phone) phone, COUNT(*) invoices, SUM(x.total) total, SUM(x.paid) paid, SUM(x.total-x.paid) balance, SUM(x.total-x.tax-x.cost) profit "
+              f"FROM sdocs x LEFT JOIN customers c ON c.id=x.customer_id WHERE {w} GROUP BY COALESCE(CAST(x.customer_id AS TEXT), 'w:'||x.customer_name) ORDER BY total DESC, COALESCE(CAST(x.customer_id AS TEXT), 'w:'||x.customer_name)", p)
     cols = [C('customer', 'Customer'), C('phone', 'Phone'), C('invoices', 'Invoices', n=1), C('total', 'Sales', m=1), C('paid', 'Paid', m=1), C('balance', 'Balance due', m=1)]
     if adm: cols.append(C('profit', 'Gross profit', m=1))
     else:
@@ -139,9 +139,9 @@ def r_sales_customer(f, adm):
 def r_sales_item(f, adm):
     w, p = inv_filter(f)
     if f['item_id']: w += ' AND l.item_id=?'; p.append(f['item_id'])
-    rs = rows(f"SELECT COALESCE(i.name,l.description) item, COALESCE(i.type,'custom') type, i.category, SUM(l.qty) qty, SUM(l.amount) sales, SUM(l.qty*l.unit_cost) cost, SUM(l.amount-l.qty*l.unit_cost) profit, "
+    rs = rows(f"SELECT MAX(COALESCE(i.name,l.description)) item, MAX(COALESCE(i.type,'custom')) AS type, MAX(i.category) AS category, SUM(l.qty) qty, SUM(l.amount) sales, SUM(l.qty*l.unit_cost) cost, SUM(l.amount-l.qty*l.unit_cost) profit, "
               f"CASE WHEN SUM(l.qty)>0 THEN SUM(l.amount)/SUM(l.qty) ELSE 0 END avg_price FROM sdoc_lines l JOIN sdocs x ON x.id=l.doc_id LEFT JOIN items i ON i.id=l.item_id WHERE {w} "
-              "GROUP BY COALESCE(CAST(l.item_id AS TEXT), 'd:'||l.description) ORDER BY sales DESC", p)
+              "GROUP BY COALESCE(CAST(l.item_id AS TEXT), 'd:'||l.description) ORDER BY sales DESC, COALESCE(CAST(l.item_id AS TEXT), 'd:'||l.description)", p)
     for r in rs:
         r['type'] = {'inventory': 'Stock item', 'service': 'Service', 'non_inventory': 'Non-stock item', 'custom': 'Custom line'}.get(r['type'], r['type'])
         r['margin'] = round(r['profit'] / r['sales'] * 100, 1) if r['sales'] else 0; r['avg_price'] = rnd(r['avg_price'])
@@ -153,8 +153,8 @@ def r_sales_item(f, adm):
 
 def r_sales_user(f, adm):
     w, p = inv_filter(f)
-    rs = rows(f"SELECT x.user_id, COALESCE(u.name,'—') staff, u.position, COUNT(*) invoices, SUM(x.total) total, SUM(x.paid) paid, SUM(x.total-x.paid) balance, SUM(x.total-x.tax-x.cost) profit, COUNT(DISTINCT x.customer_id) customers "
-              f"FROM sdocs x LEFT JOIN users u ON u.id=x.user_id WHERE {w} GROUP BY x.user_id ORDER BY total DESC", p)
+    rs = rows(f"SELECT x.user_id, MAX(COALESCE(u.name,'—')) staff, MAX(u.position) AS position, COUNT(*) invoices, SUM(x.total) total, SUM(x.paid) paid, SUM(x.total-x.paid) balance, SUM(x.total-x.tax-x.cost) profit, COUNT(DISTINCT x.customer_id) customers "
+              f"FROM sdocs x LEFT JOIN users u ON u.id=x.user_id WHERE {w} GROUP BY x.user_id ORDER BY total DESC, x.user_id", p)
     qs = {r['user_id']: r for r in rows("SELECT user_id, COUNT(*) n, SUM(total) v FROM sdocs WHERE kind='quote' AND status<>'void' AND date BETWEEN ? AND ? GROUP BY user_id", (f['from'], f['to']))}
     for r in rs: r['quotes'] = int((qs.get(r.pop('user_id')) or {}).get('n') or 0)
     cols = [C('staff', 'Staff member'), C('position', 'Position'), C('invoices', 'Invoices', n=1), C('customers', 'Customers served', n=1), C('total', 'Sales', m=1), C('paid', 'Collected', m=1), C('balance', 'Still owed', m=1), C('quotes', 'Quotations', n=1)]
@@ -235,11 +235,11 @@ def r_statement(f, adm):
         ev.append((x['date'], 0, {'date': x['date'], 'ref': x['number'], 'desc': 'Invoice' + (f" (due {x['due_date']})" if x['due_date'] else ''), 'charge': x['total'], 'payment': 0.0}))
     for p in rows("SELECT p.date,p.amount,p.method,x.number FROM cust_payments p JOIN sdocs x ON x.id=p.doc_id WHERE x.customer_id=? AND p.date<=?", (f['customer_id'], f['to'])):
         ev.append((p['date'], 1, {'date': p['date'], 'ref': p['number'], 'desc': f"Payment — {p['method']}", 'charge': 0.0, 'payment': p['amount']}))
-    for r in rows("SELECT r.id,r.device,date(r.received_at,'unixepoch','localtime') d,r.price-r.discount v FROM repairs r WHERE r.customer_id=? AND r.price-r.discount>0 AND date(r.received_at,'unixepoch','localtime')<=?", (f['customer_id'], f['to'])):
+    for r in rows("SELECT r.id,r.device,hic_day(r.received_at) d,r.price-r.discount v FROM repairs r WHERE r.customer_id=? AND r.price-r.discount>0 AND hic_day(r.received_at)<=?", (f['customer_id'], f['to'])):
         ev.append((r['d'], 0, {'date': r['d'], 'ref': f"RP-{r['id']:05d}", 'desc': f"Hardware repair — {r['device']}", 'charge': r['v'], 'payment': 0.0}))
     for p in rows('SELECT p.date,p.amount,p.method,r.id FROM repair_payments p JOIN repairs r ON r.id=p.repair_id WHERE r.customer_id=? AND p.date<=?', (f['customer_id'], f['to'])):
         ev.append((p['date'], 1, {'date': p['date'], 'ref': f"RP-{p['id']:05d}", 'desc': f"Repair payment — {p['method']}", 'charge': 0.0, 'payment': p['amount']}))
-    for j in rows("SELECT j.id,j.kind,j.device,date(j.received_at,'unixepoch','localtime') d,j.price-j.discount v FROM soft_jobs j WHERE j.customer_id=? AND j.price-j.discount>0 AND date(j.received_at,'unixepoch','localtime')<=?", (f['customer_id'], f['to'])):
+    for j in rows("SELECT j.id,j.kind,j.device,hic_day(j.received_at) d,j.price-j.discount v FROM soft_jobs j WHERE j.customer_id=? AND j.price-j.discount>0 AND hic_day(j.received_at)<=?", (f['customer_id'], f['to'])):
         ev.append((j['d'], 0, {'date': j['d'], 'ref': f"SW-{j['id']:05d}", 'desc': f"Software service — {j['device']}", 'charge': j['v'], 'payment': 0.0}))
     for p in rows('SELECT p.date,p.amount,p.method,j.id FROM soft_payments p JOIN soft_jobs j ON j.id=p.job_id WHERE j.customer_id=? AND p.date<=?', (f['customer_id'], f['to'])):
         ev.append((p['date'], 1, {'date': p['date'], 'ref': f"SW-{p['id']:05d}", 'desc': f"Software payment — {p['method']}", 'charge': 0.0, 'payment': p['amount']}))
@@ -258,7 +258,7 @@ def r_expenses_cat(f, adm):
     w, p = ['e.date BETWEEN ? AND ?'], [f['from'], f['to']]
     for k, col in (('category_id', 'e.category_id'), ('vendor_id', 'e.vendor_id'), ('user_id', 'e.user_id')):
         if f[k]: w.append(f'{col}=?'); p.append(f[k])
-    rs = rows('SELECT c.name category, COUNT(*) entries, SUM(e.amount) amount FROM expense_entries e LEFT JOIN exp_categories c ON c.id=e.category_id WHERE ' + ' AND '.join(w) + ' GROUP BY e.category_id ORDER BY amount DESC', p)
+    rs = rows('SELECT MAX(c.name) category, COUNT(*) entries, SUM(e.amount) amount FROM expense_entries e LEFT JOIN exp_categories c ON c.id=e.category_id WHERE ' + ' AND '.join(w) + ' GROUP BY e.category_id ORDER BY amount DESC, e.category_id', p)
     tot = sum(r['amount'] for r in rs) or 1
     for r in rs: r['share'] = round(r['amount'] / tot * 100, 1)
     return {'columns': [C('category', 'Category'), C('entries', 'Entries', n=1), C('amount', 'Amount', m=1), C('share', '% of expenses', p=1)], 'rows': rs}
@@ -292,7 +292,7 @@ def r_stock(f, adm):
     if f['item_id']: w.append('i.id=?'); p.append(f['item_id'])
     if f['vendor_id']: w.append('i.vendor_id=?'); p.append(f['vendor_id'])
     as_of = f['to']; rs = []
-    for i in rows('SELECT i.*,v.name vendor FROM items i LEFT JOIN vendors v ON v.id=i.vendor_id WHERE ' + ' AND '.join(w) + ' ORDER BY i.category,i.name', p):
+    for i in rows('SELECT i.*,v.name vendor FROM items i LEFT JOIN vendors v ON v.id=i.vendor_id WHERE ' + ' AND '.join(w) + ' ORDER BY i.category NULLS FIRST,lower(i.name)', p):
         qh = float(val('SELECT COALESCE(SUM(qty),0) FROM stock_moves WHERE item_id=? AND date<=?', (i['id'], as_of)) or 0) if as_of < today() else float(i['qty'])
         r = {'item': i['name'], 'sku': i['sku'], 'category': i['category'], 'vendor': i['vendor'], 'qty': round(qh, 3), 'reorder': i['reorder'], 'price': i['sale_price'], 'retail': rnd(qh * float(i['sale_price']))}
         if adm: r.update({'cost': rnd(float(i['cost'])), 'value': rnd(qh * float(i['cost']))})
@@ -304,7 +304,7 @@ def r_stock(f, adm):
 def r_low_stock(f, adm):
     rs = [{'item': i['name'], 'category': i['category'], 'vendor': i['vendor'], 'qty': float(i['qty']), 'reorder': i['reorder'], 'state': 'OUT OF STOCK' if float(i['qty']) <= 0 else 'Low',
            'suggest': max(0, int(i['reorder']) * 2 - int(float(i['qty'])))}
-          for i in rows("SELECT i.*,v.name vendor FROM items i LEFT JOIN vendors v ON v.id=i.vendor_id WHERE i.type='inventory' AND i.active=1 AND i.qty<=i.reorder" + (' AND i.vendor_id=?' if f['vendor_id'] else '') + ' ORDER BY i.qty,i.name', (f['vendor_id'],) if f['vendor_id'] else ())]
+          for i in rows("SELECT i.*,v.name vendor FROM items i LEFT JOIN vendors v ON v.id=i.vendor_id WHERE i.type='inventory' AND i.active=1 AND i.qty<=i.reorder" + (' AND i.vendor_id=?' if f['vendor_id'] else '') + ' ORDER BY i.qty,lower(i.name)', (f['vendor_id'],) if f['vendor_id'] else ())]
     return {'columns': [C('item', 'Item'), C('category', 'Category'), C('vendor', 'Usual store'), C('qty', 'On hand', n=1), C('reorder', 'Reorder at'), C('suggest', 'Suggested order', n=1), C('state', 'Status')], 'rows': rs}
 
 def r_moves(f, adm):
@@ -327,28 +327,28 @@ def r_moves(f, adm):
 
 # ---------------------------------------------------------------- operations (kept from the previous reports)
 def r_repairs(f, adm):
-    w, p = ["date(r.received_at,'unixepoch','localtime') BETWEEN ? AND ?"], [f['from'], f['to']]
+    w, p = ['hic_day(r.received_at) BETWEEN ? AND ?'], [f['from'], f['to']]
     if f['customer_id']: w.append('r.customer_id=?'); p.append(f['customer_id'])
     if f['user_id']: w.append('r.technician_id=?'); p.append(f['user_id'])
     out = []
-    for r in rows("SELECT r.id,date(r.received_at,'unixepoch','localtime') d,c.name cn,c.phone,r.device,r.problem,r.status,r.price,r.discount,u.name tech,COALESCE((SELECT SUM(amount) FROM repair_payments WHERE repair_id=r.id),0) paid FROM repairs r JOIN customers c ON c.id=r.customer_id LEFT JOIN users u ON u.id=r.technician_id WHERE " + ' AND '.join(w) + ' ORDER BY r.id DESC', p):
+    for r in rows("SELECT r.id,hic_day(r.received_at) d,c.name cn,c.phone,r.device,r.problem,r.status,r.price,r.discount,u.name tech,COALESCE((SELECT SUM(amount) FROM repair_payments WHERE repair_id=r.id),0) paid FROM repairs r JOIN customers c ON c.id=r.customer_id LEFT JOIN users u ON u.id=r.technician_id WHERE " + ' AND '.join(w) + ' ORDER BY r.id DESC', p):
         ch = float(r['price'] or 0) - float(r['discount'] or 0)
         out.append({'date': r['d'], 'customer': r['cn'], 'phone': r['phone'], 'device': r['device'], 'problem': r['problem'], 'status': r['status'], 'technician': r['tech'], 'price': rnd(ch), 'paid': rnd(float(r['paid'])), 'balance': rnd(ch - float(r['paid']))})
     return {'columns': [C('date', 'Received'), C('customer', 'Customer'), C('phone', 'Phone'), C('device', 'Device'), C('problem', 'Problem'), C('status', 'Status', st=1), C('technician', 'Technician'), C('price', 'Charge', m=1), C('paid', 'Paid', m=1), C('balance', 'Balance', m=1)], 'rows': out}
 
 def r_software(f, adm):
-    w, p = ["date(j.received_at,'unixepoch','localtime') BETWEEN ? AND ?"], [f['from'], f['to']]
+    w, p = ['hic_day(j.received_at) BETWEEN ? AND ?'], [f['from'], f['to']]
     if f['customer_id']: w.append('j.customer_id=?'); p.append(f['customer_id'])
     if f['user_id']: w.append('j.technician_id=?'); p.append(f['user_id'])
     names = {'repair': 'Software repair', 'unlock': 'Apple Unlock', 'newid': 'New Apple ID'}; out = []
-    for r in rows("SELECT j.kind,j.device,j.status,j.price,j.discount,date(j.received_at,'unixepoch','localtime') d,c.name cn,c.phone,u.name tech,COALESCE((SELECT SUM(amount) FROM soft_payments WHERE job_id=j.id),0) paid FROM soft_jobs j JOIN customers c ON c.id=j.customer_id LEFT JOIN users u ON u.id=j.technician_id WHERE " + ' AND '.join(w) + ' ORDER BY j.id DESC', p):
+    for r in rows("SELECT j.kind,j.device,j.status,j.price,j.discount,hic_day(j.received_at) d,c.name cn,c.phone,u.name tech,COALESCE((SELECT SUM(amount) FROM soft_payments WHERE job_id=j.id),0) paid FROM soft_jobs j JOIN customers c ON c.id=j.customer_id LEFT JOIN users u ON u.id=j.technician_id WHERE " + ' AND '.join(w) + ' ORDER BY j.id DESC', p):
         ch = float(r['price'] or 0) - float(r['discount'] or 0)
         out.append({'date': r['d'], 'service': names.get(r['kind'], r['kind']), 'customer': r['cn'], 'phone': r['phone'], 'device': r['device'], 'status': r['status'], 'user': r['tech'], 'price': rnd(ch), 'paid': rnd(float(r['paid'])), 'balance': rnd(ch - float(r['paid']))})
     return {'columns': [C('date', 'Received'), C('service', 'Service'), C('customer', 'Customer'), C('phone', 'Phone'), C('device', 'Device'), C('status', 'Status', st=1), C('user', 'Software user'), C('price', 'Charge', m=1), C('paid', 'Paid', m=1), C('balance', 'Balance', m=1)], 'rows': out}
 
 def r_followups(f, adm):
     out = [{'customer': x['cn'], 'phone': x['phone'], 'type': str(x['type']).replace('_', ' ').capitalize(), 'note': x['note'], 'due': x['due_date']}
-           for x in rows('SELECT f.*,c.name cn,c.phone FROM followups f JOIN customers c ON c.id=f.customer_id WHERE f.done=0' + (' AND f.customer_id=?' if f['customer_id'] else '') + ' ORDER BY f.due_date', (f['customer_id'],) if f['customer_id'] else ())]
+           for x in rows('SELECT f.*,c.name cn,c.phone FROM followups f JOIN customers c ON c.id=f.customer_id WHERE f.done=0' + (' AND f.customer_id=?' if f['customer_id'] else '') + ' ORDER BY f.due_date NULLS FIRST', (f['customer_id'],) if f['customer_id'] else ())]
     return {'columns': [C('customer', 'Customer'), C('phone', 'Phone'), C('type', 'Follow-up'), C('note', 'Note'), C('due', 'Due')], 'rows': out}
 
 

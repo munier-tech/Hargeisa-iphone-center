@@ -56,7 +56,7 @@ def act_customers_list(inp):
       COALESCE((SELECT SUM(p.amount) FROM repair_payments p JOIN repairs r ON r.id=p.repair_id WHERE r.customer_id=c.id),0) -
       COALESCE((SELECT SUM(p.amount) FROM soft_payments p JOIN soft_jobs sj ON sj.id=p.job_id WHERE sj.customer_id=c.id),0) +
       COALESCE((SELECT SUM(s.total-s.paid) FROM sdocs s WHERE s.customer_id=c.id AND s.kind IN ('invoice','receipt') AND s.status<>'void'),0) balance,
-      MAX(COALESCE((SELECT MAX(received_at) FROM repairs r WHERE r.customer_id=c.id),0),COALESCE((SELECT MAX(received_at) FROM soft_jobs sj WHERE sj.customer_id=c.id),0)) last_visit
+      GREATEST(COALESCE((SELECT MAX(received_at) FROM repairs r WHERE r.customer_id=c.id),0),COALESCE((SELECT MAX(received_at) FROM soft_jobs sj WHERE sj.customer_id=c.id),0)) last_visit
       FROM customers c ORDER BY c.id DESC""")
 
 def act_customer_save(inp):
@@ -82,7 +82,7 @@ def act_customer_find(inp):
     t = str(inp.get('q') or '').strip()
     if len(t) < 2: return []
     like = '%' + t.replace('%', '\\%').replace('_', '\\_') + '%'; k = phone_key(t)
-    return rows("SELECT id,name,phone,email FROM customers WHERE name LIKE ? ESCAPE '\\' OR " + ('phone_key LIKE ?' if k else 'phone LIKE ?') + ' ORDER BY name LIMIT 8', (like, f'%{k}%' if k else like))
+    return rows("SELECT id,name,phone,email FROM customers WHERE name ILIKE ? ESCAPE '\\' OR " + ('phone_key LIKE ?' if k else 'phone ILIKE ?') + ' ORDER BY name LIMIT 8', (like, f'%{k}%' if k else like))
 
 def act_customer_get(inp):
     need('customers', 'view'); id_ = I(inp.get('id'))
@@ -91,12 +91,12 @@ def act_customer_get(inp):
     adm = is_admin()
     repairs = rows("""SELECT r.id,r.device,r.problem,r.status,r.outcome,r.received_at,r.price,r.discount,r.expected_date,u.name tech,
         COALESCE((SELECT SUM(amount) FROM repair_payments WHERE repair_id=r.id),0) paid,
-        (SELECT GROUP_CONCAT(p.name||' ×'||rp.qty, ', ') FROM repair_parts rp JOIN items p ON p.id=rp.product_id WHERE rp.repair_id=r.id) parts
+        (SELECT string_agg(p.name||' ×'||rp.qty, ', ' ORDER BY rp.id) FROM repair_parts rp JOIN items p ON p.id=rp.product_id WHERE rp.repair_id=r.id) parts
         FROM repairs r LEFT JOIN users u ON u.id=COALESCE(r.technician_id,r.created_by) WHERE r.customer_id=? ORDER BY r.received_at DESC""", (id_,))
     apple = rows('SELECT a.id,a.model,a.apple_id,a.status,a.date,a.expected_date,u.name handled FROM appleids a LEFT JOIN users u ON u.id=a.created_by WHERE a.customer_id=?' + ('' if adm else ' AND a.hidden=0') + ' ORDER BY a.id DESC', (id_,)) if can('appleid', 'view') else []
     regional = rows('SELECT g.id,g.device,g.problem,g.region,g.status,g.date_sent,u.name handled FROM regional g LEFT JOIN users u ON u.id=g.created_by WHERE g.customer_id=? ORDER BY g.id DESC', (id_,)) if can('regional', 'view') else []
     sales = acc.docs_query({'customer_id': id_}) if can('sales', 'view') else []
-    follow = rows('SELECT f.*,u.name by_name FROM followups f LEFT JOIN users u ON u.id=f.created_by WHERE f.customer_id=? ORDER BY f.done,f.due_date', (id_,))
+    follow = rows('SELECT f.*,u.name by_name FROM followups f LEFT JOIN users u ON u.id=f.created_by WHERE f.customer_id=? ORDER BY f.done,f.due_date NULLS FIRST', (id_,))
     pay = rows("SELECT p.id,p.amount,p.method,p.date,p.note,'Hardware: '||r.device device,u.name by_name FROM repair_payments p JOIN repairs r ON r.id=p.repair_id LEFT JOIN users u ON u.id=p.user_id WHERE r.customer_id=?", (id_,))
     soft = rows("""SELECT j.id,j.kind,j.device,j.imei,j.apple_id,j.problem,j.status,j.received_at,j.expected_date,j.price,j.discount,u.name tech,
         COALESCE((SELECT SUM(amount) FROM soft_payments WHERE job_id=j.id),0) paid FROM soft_jobs j LEFT JOIN users u ON u.id=COALESCE(j.technician_id,j.created_by) WHERE j.customer_id=? ORDER BY j.received_at DESC""", (id_,)) if can('software', 'view') else []
@@ -291,7 +291,7 @@ def act_repair_delete(inp):
 def apple_vis() -> str: return '' if is_admin() else ' AND a.hidden=0'
 APPLE_COLS = """a.id,a.customer_id,a.customer_name,a.phone,a.model,a.apple_id,a.description,a.date,a.hidden,a.status,a.request_date,a.expected_date,a.assigned_to,a.notes,a.ts,
   u.name created_name, s.name assigned_name,
-  CASE WHEN a.expected_date IS NULL THEN NULL ELSE CAST(julianday(a.expected_date)-julianday(date('now','localtime')) AS INTEGER) END days_left"""
+  hic_days_until(a.expected_date) days_left"""
 
 def act_appleid_list(inp):
     need('appleid', 'view')

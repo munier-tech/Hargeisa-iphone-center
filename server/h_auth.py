@@ -27,7 +27,7 @@ def act_login(inp):
     q('DELETE FROM login_attempts WHERE ts<?', (now() - 7 * 86400,))         # kept a week so the Security Center can show recent failures
     lock_min = max(1, I(setting('sec_lock_min', '10'))); max_try = max(3, I(setting('sec_max_attempts', '8')))
     if int(val('SELECT COUNT(*) FROM login_attempts WHERE k=? AND ts>?', (key, now() - lock_min * 60))) >= max_try: raise ApiError(f'Too many attempts. Please try again in {lock_min} minutes.', 429)
-    u = row('SELECT * FROM users WHERE email=?', (email,))
+    u = row('SELECT * FROM users WHERE lower(email)=lower(?)', (email,))
     if not u or not verify_pw(pw, u['password']):
         defer('INSERT INTO login_attempts(k,ts) VALUES(?,?)', (key, now()))     # must survive the rollback of this failed request
         raise ApiError('Invalid email or password.', 401)
@@ -70,7 +70,7 @@ def act_staff_register(inp):
     pos = 'Software' if inp.get('position') == 'Software' else 'Technician'
     if not name or not valid_email(email): raise ApiError('Enter a valid name and email.')
     if len(pw.encode()) < pw_min(): raise ApiError(f'Password must be at least {pw_min()} characters.')
-    if val('SELECT 1 FROM users WHERE email=?', (email,)): raise ApiError('That email is already registered.')
+    if val('SELECT 1 FROM users WHERE lower(email)=lower(?)', (email,)): raise ApiError('That email is already registered.')
     id_ = ins('users', {'name': name, 'email': email, 'password': hash_pw(pw), 'position': pos, 'status': 'pending', 'perms': json.dumps(default_perms(pos)), 'created_at': now()})
     notify('new_user', f'New user registration: {name} ({pos}) is awaiting approval.', 'admin', '#/users')
     return {'id': id_}
@@ -98,7 +98,7 @@ def act_user_detail(inp):
     return {'user': p,
             'activity': rows("SELECT action,entity,entity_id,detail,ts FROM activity WHERE user_id=? AND action NOT IN ('login','logout') ORDER BY id DESC LIMIT 100", (id_,)),
             'sessions': rows("SELECT action,ts FROM activity WHERE user_id=? AND action IN ('login','logout') ORDER BY id DESC LIMIT 30", (id_,)),
-            'by_entity': rows("SELECT entity,COUNT(*) n FROM activity WHERE user_id=? AND action NOT IN ('login','logout') GROUP BY entity ORDER BY n DESC", (id_,)),
+            'by_entity': rows("SELECT entity,COUNT(*) n FROM activity WHERE user_id=? AND action NOT IN ('login','logout') GROUP BY entity ORDER BY n DESC, entity", (id_,)),
             'totals': {'all': int(val("SELECT COUNT(*) FROM activity WHERE user_id=? AND action NOT IN ('login','logout')", (id_,)) or 0),
                        'days30': int(val("SELECT COUNT(*) FROM activity WHERE user_id=? AND action NOT IN ('login','logout') AND ts>=?", (id_, t - 30 * 86400)) or 0),
                        'today': int(val("SELECT COUNT(*) FROM activity WHERE user_id=? AND action NOT IN ('login','logout') AND ts>=?", (id_, t - t % 86400)) or 0),
@@ -124,7 +124,7 @@ def act_user_save(inp):
     me_ = admin(); id_ = I(inp.get('id')); name = s(inp.get('name'), 80); email = s(inp.get('email'), 120).lower()
     pos = 'Software' if inp.get('position') == 'Software' else 'Technician'
     if not name or not valid_email(email): raise ApiError('Enter a valid name and email.')
-    if val('SELECT id FROM users WHERE email=? AND id<>?', (email, id_)): raise ApiError('That email is already used by another user.')
+    if val('SELECT id FROM users WHERE lower(email)=lower(?) AND id<>?', (email, id_)): raise ApiError('That email is already used by another user.')
     pw = str(inp.get('password') or '')
     role = inp.get('role') if me_.get('is_owner') and inp.get('role') in ('admin', 'staff') else None     # only the owner may grant / remove Super Admin
     if id_:
@@ -186,7 +186,7 @@ def act_profile_update(inp):
     if 'email' in inp and inp['email'] is not None:
         e = s(inp['email'], 120).lower()
         if not valid_email(e): raise ApiError('Enter a valid email.')
-        if val('SELECT 1 FROM users WHERE email=? AND id<>?', (e, u['id'])): raise ApiError('That email is already used.')
+        if val('SELECT 1 FROM users WHERE lower(email)=lower(?) AND id<>?', (e, u['id'])): raise ApiError('That email is already used.')
         dd['email'] = e
     if not empty(inp.get('new_password')):
         if not verify_pw(str(inp.get('current_password') or ''), u['password']): raise ApiError('Current password is incorrect.')
@@ -224,7 +224,7 @@ def act_notif_read(inp):
 
 def act_audit_list(inp):
     admin()
-    return rows('SELECT a.id,a.action,a.entity,a.entity_id,a.detail,a.ts,u.name user FROM activity a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 500')
+    return rows('SELECT a.id,a.action,a.entity,a.entity_id,a.detail,a.ts,u.name AS "user" FROM activity a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 500')
 
 def act_my_activity(inp):
     u = me()
@@ -235,7 +235,7 @@ def act_password_request(inp):
     email = s(inp.get('email'), 120).lower(); key = f'{_ip()}|pr'
     if int(val('SELECT COUNT(*) FROM login_attempts WHERE k=? AND ts>?', (key, now() - 600))) >= 5: raise ApiError('Too many requests. Please try again later.', 429)
     ins('login_attempts', {'k': key, 'ts': now()})
-    u = row("SELECT id,name FROM users WHERE email=? AND status='active'", (email,))
+    u = row("SELECT id,name FROM users WHERE lower(email)=lower(?) AND status='active'", (email,))
     if u: notify('system', f"Password reset requested by {u['name']} ({email}). Open Users → Edit to set a new password.", 'admin', '#/users', f"pr:{u['id']}:" + local_now().strftime('%Y%m%d%H'))
     return []
 
@@ -258,13 +258,13 @@ def act_dashboard(inp):
     st['followups'] = v('SELECT COUNT(*) FROM followups WHERE done=0')
     st['appleid_open'] = v("SELECT COUNT(*) FROM appleids WHERE status IN ('request','received','progress')" + ('' if adm else ' AND hidden=0'))
     st['regional_open'] = v("SELECT COUNT(*) FROM regional WHERE status NOT IN ('collected','failed','ready')")
-    gender = rows("SELECT COALESCE(NULLIF(gender,''),'Unknown') label, COUNT(*) v FROM customers GROUP BY 1")
-    repairs_by = rows('SELECT status label, COUNT(*) v FROM repairs GROUP BY status')
+    gender = rows("SELECT COALESCE(NULLIF(gender,''),'Unknown') label, COUNT(*) v FROM customers GROUP BY 1 ORDER BY 1")
+    repairs_by = rows('SELECT status label, COUNT(*) v FROM repairs GROUP BY status ORDER BY status')
     start = t - 24 * 3600; wave = [0] * 24
     for r in rows("SELECT ts FROM activity WHERE ts>=? AND action NOT IN ('login','logout')", (start,)): wave[min(23, (r['ts'] - start) // 3600)] += 1
     wave_labels = [fdate(start + i * 3600 + 3600, '%H:%M') for i in range(24)]
-    active = rows("SELECT u.name,COUNT(a.id) v FROM activity a JOIN users u ON u.id=a.user_id WHERE a.ts>=? AND a.action NOT IN ('login','logout') GROUP BY u.id ORDER BY v DESC LIMIT 6", (t - 30 * 86400,))
-    prod = rows("SELECT u.name,COUNT(a.id) v FROM activity a JOIN users u ON u.id=a.user_id WHERE a.ts>=? AND a.action='status' AND a.detail IN ('completed','ready','working','finished','took_completed','returned','collected','parts_installed') GROUP BY u.id ORDER BY v DESC LIMIT 6", (t - 30 * 86400,))
+    active = rows("SELECT u.name,COUNT(a.id) v FROM activity a JOIN users u ON u.id=a.user_id WHERE a.ts>=? AND a.action NOT IN ('login','logout') GROUP BY u.id ORDER BY v DESC, u.id LIMIT 6", (t - 30 * 86400,))
+    prod = rows("SELECT u.name,COUNT(a.id) v FROM activity a JOIN users u ON u.id=a.user_id WHERE a.ts>=? AND a.action='status' AND a.detail IN ('completed','ready','working','finished','took_completed','returned','collected','parts_installed') GROUP BY u.id ORDER BY v DESC, u.id LIMIT 6", (t - 30 * 86400,))
     fin = None
     if adm and can('finance', 'view'):
         first = local_now().replace(day=1); mp_map = money_by_day(add_months(first, -11).strftime('%Y-%m-%d'), td)
@@ -280,7 +280,7 @@ def act_dashboard(inp):
         mp = [{'label': datetime.strptime(k + '-01', '%Y-%m-%d').strftime('%b'), 'v': rnd(m['income'] - m['cost'] - m['expense']), 'income': rnd(m['income']), 'expense': rnd(m['expense'])} for k, m in monthly.items()]
         inc = cost = exp = 0.0
         for m in money_by_day('2000-01-01', td).values(): inc += m['income']; cost += m['cost']; exp += m['expense']
-        fin = {'sales': rnd(inc), 'expenses': rnd(exp), 'profit': rnd(inc - cost - exp), 'daily': daily, 'monthly': mp, 'expense_cats': rows('SELECT c.name label, ROUND(SUM(e.amount),2) v FROM expense_entries e JOIN exp_categories c ON c.id=e.category_id GROUP BY c.id ORDER BY v DESC')}
+        fin = {'sales': rnd(inc), 'expenses': rnd(exp), 'profit': rnd(inc - cost - exp), 'daily': daily, 'monthly': mp, 'expense_cats': rows('SELECT c.name label, ROUND(CAST(SUM(e.amount) AS NUMERIC),2) v FROM expense_entries e JOIN exp_categories c ON c.id=e.category_id GROUP BY c.id ORDER BY v DESC, c.id')}
         st['sales'], st['expenses'], st['profit'] = fin['sales'], fin['expenses'], fin['profit']
     recent = {'repairs': [], 'software': [], 'customers': [], 'sales': [], 'due': [], 'low_stock': [], 'activity': []}
     if can('repairs', 'view'): recent['repairs'] = rows('SELECT r.id,r.device,r.status,r.received_at,c.name customer FROM repairs r JOIN customers c ON c.id=r.customer_id ORDER BY r.id DESC LIMIT 5')
@@ -288,11 +288,10 @@ def act_dashboard(inp):
     if can('customers', 'view'): recent['customers'] = rows('SELECT id,name,phone,created_at FROM customers ORDER BY id DESC LIMIT 5')
     if can('sales', 'view'): recent['sales'] = rows("SELECT id,number,date,customer_name,total,paid,status FROM sdocs WHERE kind IN ('invoice','receipt') AND status<>'void' ORDER BY id DESC LIMIT 5")
     if can('inventory', 'view'): recent['low_stock'] = rows("SELECT name,reorder min_stock,qty rem FROM items WHERE type='inventory' AND active=1 AND qty<=reorder ORDER BY qty LIMIT 6")
-    dl = "CASE WHEN expected_date IS NULL THEN NULL ELSE CAST(julianday(expected_date)-julianday(date('now','localtime')) AS INTEGER) END"
-    if can('appleid', 'view'): recent['due'] += rows(f"SELECT 'Apple ID' k,customer_name c,model d,status,expected_date,{dl} days FROM appleids WHERE status IN ('request','received','progress') AND expected_date IS NOT NULL" + ('' if adm else ' AND hidden=0') + ' ORDER BY expected_date LIMIT 6')
-    if can('software', 'view'): recent['due'] += rows("SELECT 'Apple Unlock' k,c.name c,j.device d,j.status,j.expected_date,CASE WHEN j.expected_date IS NULL THEN NULL ELSE CAST(julianday(j.expected_date)-julianday(date('now','localtime')) AS INTEGER) END days FROM soft_jobs j JOIN customers c ON c.id=j.customer_id WHERE j.kind='unlock' AND j.status IN ('request','received','in_progress','waiting') AND j.expected_date IS NOT NULL ORDER BY j.expected_date LIMIT 6")
+    if can('appleid', 'view'): recent['due'] += rows("SELECT 'Apple ID' k,customer_name c,model d,status,expected_date,hic_days_until(expected_date) days FROM appleids WHERE status IN ('request','received','progress') AND expected_date IS NOT NULL" + ('' if adm else ' AND hidden=0') + ' ORDER BY expected_date LIMIT 6')
+    if can('software', 'view'): recent['due'] += rows("SELECT 'Apple Unlock' k,c.name c,j.device d,j.status,j.expected_date,hic_days_until(j.expected_date) days FROM soft_jobs j JOIN customers c ON c.id=j.customer_id WHERE j.kind='unlock' AND j.status IN ('request','received','in_progress','waiting') AND j.expected_date IS NOT NULL ORDER BY j.expected_date LIMIT 6")
     recent['due'] = sorted(recent['due'], key=lambda r: 999 if r['days'] is None else r['days'])[:6]
-    recent['activity'] = rows("SELECT a.action,a.entity,a.entity_id,a.detail,a.ts,u.name user FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.action NOT IN ('login','logout')" + ('' if adm else f" AND a.user_id={int(u['id'])}") + ' ORDER BY a.id DESC LIMIT 8')
+    recent['activity'] = rows("SELECT a.action,a.entity,a.entity_id,a.detail,a.ts,u.name AS \"user\" FROM activity a LEFT JOIN users u ON u.id=a.user_id WHERE a.action NOT IN ('login','logout')" + ('' if adm else f" AND a.user_id={int(u['id'])}") + ' ORDER BY a.id DESC LIMIT 8')
     return {'recent': recent, 'stats': st, 'gender': gender, 'repairs_by': repairs_by, 'wave': {'values': wave, 'labels': wave_labels, 'online': st['online']}, 'most_active': active, 'most_productive': prod, 'finance': fin}
 
 
@@ -315,7 +314,7 @@ def act_search(inp):
     if len(t) < 2: return []
     dm = DOC_NO.fullmatch(t)
     if dm and dm.group(1): return doc_hits(int(dm.group(2)), dm.group(1).lower())          # 'INV-12' / 'R-45' go straight to the document
-    like = '%' + t.replace('%', '\\%').replace('_', '\\_') + '%'; k = phone_key(t); out = []; L = " LIKE ? ESCAPE '\\'"
+    like = '%' + t.replace('%', '\\%').replace('_', '\\_') + '%'; k = phone_key(t); out = []; L = " ILIKE ? ESCAPE '\\'"     # ILIKE: case-insensitive, as SQLite's LIKE was
     if can('customers', 'view'):
         for r in rows(f'SELECT id,name,phone FROM customers WHERE name{L} OR phone{L}' + (' OR phone_key LIKE ?' if k else '') + ' LIMIT 5', (like, like, f'%{k}%') if k else (like, like)):
             out.append({'g': 'Customers', 'ic': 'user', 't': r['name'], 's': r['phone'], 'l': f"#/customers/{r['id']}"})

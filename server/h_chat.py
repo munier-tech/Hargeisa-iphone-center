@@ -88,7 +88,7 @@ def act_chat_sync(inp):
         convs.append({'id': int(c['id']), 'kind': c['kind'], 'name': c['name'], 'unread': int(c['unread']), 'members': [{'id': int(m['user_id']), 'role': m['role'], 'read': int(m['last_read_id'] or 0)} for m in mem],
                       'last': {'id': int(last['id']), 'text': _preview(last), 'ts': int(last['ts']), 'mine': int(last['user_id']) == uid} if last else None, 'ts': int(last['ts']) if last else 0})
     convs.sort(key=lambda c: -c['ts'])
-    out = {'convs': convs, 'unread': sum(c['unread'] for c in convs), 'presence': [{'id': int(r['id']), 'online': public_user(r)['online'], 'last_seen': int(r['last_seen'] or 0)} for r in rows("SELECT * FROM users WHERE status='active'")],
+    out = {'convs': convs, 'unread': sum(c['unread'] for c in convs), 'presence': [{'id': int(r['id']), 'online': public_user(r)['online'], 'last_seen': int(r['last_seen'] or 0)} for r in rows("SELECT * FROM users WHERE status='active' ORDER BY id")],
            'now': now(), 'msgs': [], 'typing': []}
     if active and member(active, uid):
         if after == 0: ms = list(reversed(rows('SELECT * FROM chat_msgs WHERE conv_id=? ORDER BY id DESC LIMIT 60', (active,))))
@@ -119,7 +119,7 @@ def act_chat_search(inp):
     u = need_chat(); cid = I(inp.get('conv_id')); need_member(cid, int(u['id'])); t = s(inp.get('q'), 80)
     if len(t) < 2: return []
     like = '%' + t.replace('%', '\\%').replace('_', '\\_') + '%'
-    return _with_replies(rows("SELECT * FROM chat_msgs WHERE conv_id=? AND deleted=0 AND (body LIKE ? ESCAPE '\\' OR att_name LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT 40", (cid, like, like)))
+    return _with_replies(rows("SELECT * FROM chat_msgs WHERE conv_id=? AND deleted=0 AND (body ILIKE ? ESCAPE '\\' OR att_name ILIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT 40", (cid, like, like)))
 
 
 # ------------------------------------------------------------------ send / delete
@@ -230,7 +230,7 @@ def act_chat_perms_get(inp):
     admin(); out = []
     for r in rows("SELECT * FROM users WHERE is_admin=0 ORDER BY status, name"):
         p = public_user(r); out.append({'id': p['id'], 'name': p['name'], 'position': p['position'], 'status': p['status'], 'perms': chat_perm_dict(r), 'online': p['online']})
-    st = row("SELECT (SELECT COUNT(*) FROM chat_msgs WHERE deleted=0) msgs,(SELECT COUNT(*) FROM chat_convs) convs,(SELECT COUNT(*) FROM chat_convs WHERE kind='group') groups").copy()
+    st = row("SELECT (SELECT COUNT(*) FROM chat_msgs WHERE deleted=0) AS msgs,(SELECT COUNT(*) FROM chat_convs) AS convs,(SELECT COUNT(*) FROM chat_convs WHERE kind='group') AS groups").copy()
     files = sum(os.path.getsize(os.path.join(CHAT_DIR, f)) for f in os.listdir(CHAT_DIR)) if os.path.isdir(CHAT_DIR) else 0
     return {'users': out, 'settings': _settings(), 'stats': {**st, 'files_bytes': files}}
 

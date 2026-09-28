@@ -31,9 +31,9 @@ def act_finance(inp):
             for f, v in x.items(): monthly[k][f] += v
     mrows = [{'month': k, 'label': datetime.strptime(k + '-01', '%Y-%m-%d').strftime('%b %y'), 'income': rnd(x['income']), 'cost': rnd(x['cost']), 'expense': rnd(x['expense']), 'v': rnd(x['income'] - x['cost'] - x['expense'])} for k, x in monthly.items()]
     ar = rnd(float(val("SELECT COALESCE(SUM(total-paid),0) FROM sdocs WHERE kind='invoice' AND status='open'") or 0))
-    stores = rows("SELECT v.id,v.name,v.phone,COALESCE(SUM(b.total),0) billed,COALESCE(SUM(b.paid),0) paid,COALESCE(SUM(b.total-b.paid),0) owed FROM vendors v JOIN bills b ON b.vendor_id=v.id AND b.status<>'void' GROUP BY v.id HAVING owed>0.005 ORDER BY owed DESC")
+    stores = rows("SELECT v.id,v.name,v.phone,COALESCE(SUM(b.total),0) billed,COALESCE(SUM(b.paid),0) paid,COALESCE(SUM(b.total-b.paid),0) owed FROM vendors v JOIN bills b ON b.vendor_id=v.id AND b.status<>'void' GROUP BY v.id HAVING COALESCE(SUM(b.total-b.paid),0)>0.005 ORDER BY owed DESC")
     return {'breakdown': finance_breakdown('2000-01-01', td), 'breakdown_month': finance_breakdown(first.strftime('%Y-%m-%d'), td), 'totals': {**tot, 'sales': rnd(sales), 'repair_income': rnd(repair_inc)}, 'week': wk, 'month': mo, 'last_month': last_mo, 'today': agg(td, td),
-            'daily': daily, 'monthly': mrows, 'expense_cats': rows('SELECT c.name label, ROUND(SUM(e.amount),2) v FROM expense_entries e JOIN exp_categories c ON c.id=e.category_id GROUP BY c.id ORDER BY v DESC'),
+            'daily': daily, 'monthly': mrows, 'expense_cats': rows('SELECT c.name label, ROUND(CAST(SUM(e.amount) AS NUMERIC),2) v FROM expense_entries e JOIN exp_categories c ON c.id=e.category_id GROUP BY c.id ORDER BY v DESC, c.id'),
             'receivable': ar, 'stores': stores, 'payable': rnd(sum(float(x['owed']) for x in stores)),
             'stock_value': rnd(float(val("SELECT COALESCE(SUM(qty*cost),0) FROM items WHERE type='inventory' AND qty>0") or 0))}
 
@@ -94,11 +94,11 @@ def portal_devices(cid: int) -> dict:
     repairs = []
     for r in rows('SELECT id,device,status,outcome,diagnosis,expected_date,received_at,closed_at,progress_notes FROM repairs WHERE customer_id=? ORDER BY id DESC', (cid,)):
         r['events'] = rows('SELECT status,ts FROM repair_events WHERE repair_id=? ORDER BY id', (r['id'],))
-        r['parts'] = rows('SELECT i.name product,SUM(rp.qty) qty FROM repair_parts rp JOIN items i ON i.id=rp.product_id WHERE rp.repair_id=? GROUP BY rp.product_id', (r['id'],))
+        r['parts'] = rows('SELECT i.name product,SUM(rp.qty) qty FROM repair_parts rp JOIN items i ON i.id=rp.product_id WHERE rp.repair_id=? GROUP BY rp.product_id,i.name ORDER BY rp.product_id', (r['id'],))
         r['parts_status'] = 'Parts used/installed' if r['parts'] else ('Waiting for part' if r['status'] == 'waiting_part' else 'No parts required yet')
         r['ready'] = r['status'] in ('ready', 'completed'); r['collected'] = r['status'] in ('took_completed', 'took_incomplete')
         r.pop('outcome', None); repairs.append(r)
-    dl = "CASE WHEN expected_date IS NULL THEN NULL ELSE CAST(julianday(expected_date)-julianday(date('now','localtime')) AS INTEGER) END"
+    dl = 'hic_days_until(expected_date)'
     return {'repairs': repairs,
             'software': rows(f'SELECT id,kind,device,status,request_date,expected_date,received_at,{dl} days_left FROM soft_jobs WHERE customer_id=? ORDER BY id DESC', (cid,)),
             'appleids': rows(f'SELECT id,model,status,request_date,expected_date,{dl} days_left FROM appleids WHERE customer_id=? AND hidden=0 ORDER BY id DESC', (cid,)),
@@ -149,7 +149,7 @@ def act_portal_list(inp):
     need('portal', 'view')
     return rows("""SELECT a.id,a.name,a.phone,a.email,a.status,a.created_at,a.last_login,a.customer_id,
         (SELECT COUNT(*) FROM repairs r WHERE r.customer_id=a.customer_id) repairs,
-        (SELECT r.device||' — '||r.status FROM repairs r WHERE r.customer_id=a.customer_id AND r.status NOT IN ('completed','took_completed','took_incomplete','failed') ORDER BY r.id DESC LIMIT 1) current
+        (SELECT r.device||' — '||r.status FROM repairs r WHERE r.customer_id=a.customer_id AND r.status NOT IN ('completed','took_completed','took_incomplete','failed') ORDER BY r.id DESC LIMIT 1) AS current
         FROM portal_accounts a ORDER BY CASE a.status WHEN 'pending' THEN 0 ELSE 1 END, a.id DESC""")
 
 def act_portal_status(inp):

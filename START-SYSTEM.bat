@@ -14,10 +14,17 @@ if not defined PY (
   pause & exit /b 1
 )
 
-rem ---- install the required packages the first time (Flask, waitress, bcrypt, cryptography)
-"%PY%" -c "import flask,waitress,bcrypt,cryptography" >nul 2>nul || (
+rem ---- install the required packages the first time (Flask, waitress, bcrypt, cryptography, psycopg)
+"%PY%" -c "import flask,waitress,bcrypt,cryptography,psycopg,psycopg_pool" >nul 2>nul || (
   echo Installing required packages...
   "%PY%" -m pip install --disable-pip-version-check -r requirements.txt
+)
+
+rem ---- the PostgreSQL (Neon) connection string: DATABASE_URL environment variable or the .env file
+if not defined DATABASE_URL if not exist ".env" (
+  echo DATABASE_URL is not set. Copy .env.example to .env and put your Neon connection string in it,
+  echo or set it once with:  setx DATABASE_URL "postgresql://..."   ^(then open a new window^)
+  pause & exit /b 1
 )
 
 echo ==================================================

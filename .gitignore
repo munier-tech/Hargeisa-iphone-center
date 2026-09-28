@@ -1,0 +1,2 @@
+# local secrets: the PostgreSQL / Neon connection string lives here, never in the repository
+.env

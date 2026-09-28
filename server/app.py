@@ -1,7 +1,7 @@
 """HARGEISA IPHONE CENTER — web server (Python / Flask + waitress).
 
 Serves the same single-page apps and the same JSON API (`/api.php?a=<action>`) as the previous PHP server, so the browser
-front end, the database and every saved record work unchanged.
+front end and every saved record work unchanged. The data lives in PostgreSQL (Neon): set DATABASE_URL first.
 
     python server/app.py            ->  http://localhost:8080
 """
@@ -60,7 +60,7 @@ def api():
         if not action or fn is None: raise ApiError('Unknown action.', 404)
         inp = request.get_json(silent=True, force=True)
         inp = inp if isinstance(inp, dict) else {}
-        q('BEGIN IMMEDIATE'); in_tx = True
+        q('BEGIN'); in_tx = True
         core.check_module(action)
         result = fn(inp)
         q('COMMIT'); in_tx = False
@@ -79,7 +79,7 @@ def api():
 
 def _rollback(in_tx: bool) -> None:
     try:
-        if in_tx and 'db' in g: g.db.execute('ROLLBACK')
+        if 'db' in g and (in_tx or core.in_tx()): q('ROLLBACK')
     except Exception: pass
     for sql, params in g.get('after_rollback', []):     # failed-login counters, forced log-outs
         try: q(sql, params)
@@ -89,9 +89,7 @@ def _rollback(in_tx: bool) -> None:
 @app.teardown_request
 def _close(exc):
     c = g.pop('db', None)
-    if c is not None:
-        try: c.close()
-        except Exception: pass
+    if c is not None: core.release(c)                  # back to the connection pool
 
 
 @app.route('/chat_file/<int:mid>')

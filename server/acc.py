@@ -33,12 +33,13 @@ METHOD_ACCOUNT = {'Cash': 'Cash', 'ZAAD': 'ZAAD', 'eDahab': 'eDahab', 'EVC / Mob
 def pick_account(inp, method: str = 'Cash') -> int | None:
     aid = I((inp or {}).get('account_id'))
     if aid and val('SELECT 1 FROM money_accounts WHERE id=? AND active=1', (aid,)): return aid
-    by = val('SELECT id FROM money_accounts WHERE active=1 AND name=?', (METHOD_ACCOUNT.get(method, method),))
+    by = val('SELECT id FROM money_accounts WHERE active=1 AND lower(name)=lower(?)', (METHOD_ACCOUNT.get(method, method),))
     return by or val("SELECT id FROM money_accounts WHERE active=1 ORDER BY CASE type WHEN 'cash' THEN 0 ELSE 1 END, id LIMIT 1")
 
 def next_no(kind: str) -> str:
     """Document numbers: INV-00001, QT-00001, BILL-00001 (counters kept in settings, safe inside the request transaction)."""
-    key = f'seq_{kind}'; nx = I(setting(key, '0')) + 1; set_setting(key, str(nx))
+    key = f'seq_{kind}'                                  # one atomic step, so two people saving at the same moment never get the same number
+    nx = I(val("INSERT INTO settings(k,v) VALUES(?, '1') ON CONFLICT(k) DO UPDATE SET v=CAST((CASE WHEN settings.v ~ '^[0-9]+$' THEN CAST(settings.v AS BIGINT) ELSE 0 END)+1 AS TEXT) RETURNING v", (key,)))
     prefix = {'invoice': setting('doc_prefix', 'INV') or 'INV', 'quote': setting('quote_prefix', 'QT') or 'QT', 'receipt': setting('receipt_prefix', 'SR') or 'SR', 'bill': 'BILL', 'payment': 'PAY'}[kind]
     return f'{prefix}-{nx:05d}'
 
@@ -59,7 +60,7 @@ def item_recalc(iid: int) -> None:
 
 def move(iid: int, qty: float, kind: str, ref_kind: str, ref_id: int, date: str, unit_cost=None, note: str = '', customer_id=None, vendor_id=None) -> float:
     """Post one stock movement. Outgoing stock is valued at the current average cost. Returns the unit cost used."""
-    it = row('SELECT * FROM items WHERE id=?', (iid,))
+    it = row('SELECT * FROM items WHERE id=? FOR UPDATE', (iid,))          # locked until the request commits: no overselling in parallel
     if not it or it['type'] != 'inventory': return 0.0
     if qty < 0:
         if float(it['qty'] or 0) + qty < -1e-9 and setting('allow_negative_stock', '0') != '1':
@@ -99,7 +100,7 @@ def act_items_list(inp):
     w, p = ['1=1'], []
     if inp.get('type') in ITEM_TYPES: w.append('i.type=?'); p.append(inp['type'])
     if not inp.get('all'): w.append('i.active=1')
-    out = rows('SELECT i.*,v.name vendor FROM items i LEFT JOIN vendors v ON v.id=i.vendor_id WHERE ' + ' AND '.join(w) + ' ORDER BY i.name', p)
+    out = rows('SELECT i.*,v.name vendor FROM items i LEFT JOIN vendors v ON v.id=i.vendor_id WHERE ' + ' AND '.join(w) + ' ORDER BY lower(i.name)', p)
     adm = see_cost()
     for r in out:
         r['low'] = r['type'] == 'inventory' and float(r['qty']) <= float(r['reorder'] or 0)
@@ -114,7 +115,7 @@ def act_item_save(inp):
          'sale_price': money_(inp.get('sale_price')), 'reorder': max(0, I(inp.get('reorder'))), 'vendor_id': I(inp.get('vendor_id')) or None,
          'description': s(inp.get('description'), 500), 'active': 0 if inp.get('active') in (False, 0, '0') else 1, 'updated_at': now()}
     if not f['name']: raise ApiError('Item name is required.')
-    if val('SELECT 1 FROM items WHERE name=? AND id<>?', (f['name'], id_)): raise ApiError('An item with this name already exists.')
+    if val('SELECT 1 FROM items WHERE lower(name)=lower(?) AND id<>?', (f['name'], id_)): raise ApiError('An item with this name already exists.')
     if f['sku'] and val('SELECT 1 FROM items WHERE sku=? AND id<>?', (f['sku'], id_)): raise ApiError('Another item already uses this SKU / code.')
     if f['vendor_id'] and not val('SELECT 1 FROM vendors WHERE id=?', (f['vendor_id'],)): f['vendor_id'] = None
     if id_:
@@ -209,7 +210,7 @@ def act_vendors_list(inp):
     bal = vendor_balances(); adm_money = can('stores', 'view')
     exp = {r['vendor_id']: float(r['v'] or 0) for r in rows('SELECT vendor_id, SUM(amount) v FROM expense_entries WHERE vendor_id IS NOT NULL GROUP BY vendor_id')}
     out = []
-    for v in rows('SELECT * FROM vendors ORDER BY active DESC, name'):
+    for v in rows('SELECT * FROM vendors ORDER BY active DESC, lower(name)'):
         b = bal.get(v['id']) or {}
         if adm_money: v.update({'bills': int(b.get('bills') or 0), 'billed': rnd(float(b.get('billed') or 0)), 'paid': rnd(float(b.get('paid') or 0)), 'owed': rnd(float(b.get('owed') or 0)), 'last': b.get('last'), 'expenses': rnd(exp.get(v['id'], 0))})
         out.append(v)
@@ -220,7 +221,7 @@ def act_vendor_save(inp):
     f = {'name': s(inp.get('name'), 100), 'contact': s(inp.get('contact'), 100), 'phone': s(inp.get('phone'), 30), 'email': s(inp.get('email'), 120), 'address': s(inp.get('address'), 200),
          'notes': s(inp.get('notes'), 500), 'active': 0 if inp.get('active') in (False, 0, '0') else 1}
     if not f['name']: raise ApiError('Store name is required.')
-    if val('SELECT 1 FROM vendors WHERE name=? AND id<>?', (f['name'], id_)): raise ApiError('A store with this name already exists.')
+    if val('SELECT 1 FROM vendors WHERE lower(name)=lower(?) AND id<>?', (f['name'], id_)): raise ApiError('A store with this name already exists.')
     if id_:
         if not val('SELECT 1 FROM vendors WHERE id=?', (id_,)): raise ApiError('Store not found.', 404)
         upd('vendors', id_, f)
@@ -258,7 +259,7 @@ def bills_query(f: dict) -> list:
     if I(f.get('vendor_id')): w.append('b.vendor_id=?'); p.append(I(f['vendor_id']))
     if d(f.get('from')): w.append('b.date>=?'); p.append(d(f['from']))
     if d(f.get('to')): w.append('b.date<=?'); p.append(d(f['to']))
-    out = rows('SELECT b.*,v.name vendor,u.name by_name,(SELECT GROUP_CONCAT(COALESCE(i.name,l.description)||\' ×\'||l.qty, char(10)) FROM bill_lines l LEFT JOIN items i ON i.id=l.item_id WHERE l.bill_id=b.id) items '
+    out = rows('SELECT b.*,v.name vendor,u.name by_name,(SELECT string_agg(COALESCE(i.name,l.description)||\' ×\'||hic_num(l.qty), chr(10) ORDER BY l.id) FROM bill_lines l LEFT JOIN items i ON i.id=l.item_id WHERE l.bill_id=b.id) items '
                'FROM bills b JOIN vendors v ON v.id=b.vendor_id LEFT JOIN users u ON u.id=b.user_id WHERE ' + ' AND '.join(w) + ' ORDER BY b.date DESC,b.id DESC LIMIT 2000', p)
     for b in out: b['state'] = bill_state(b); b['balance'] = rnd(float(b['total']) - float(b['paid'])) if b['status'] != 'void' else 0
     st = f.get('status')
@@ -313,7 +314,7 @@ def bill_refresh(bid: int) -> None:
     q("UPDATE bills SET paid=?, status=CASE WHEN status='void' THEN 'void' WHEN ?+0.005>=total THEN 'paid' ELSE 'open' END WHERE id=?", (paid, paid, bid))
 
 def vendor_pay(bid: int, amt: float, date: str, method: str, ref: str, note: str, u: dict, account_id=None) -> int:
-    b = row('SELECT * FROM bills WHERE id=?', (bid,))
+    b = row('SELECT * FROM bills WHERE id=? FOR UPDATE', (bid,))
     if not b or b['status'] == 'void': raise ApiError('Bill not found or void.')
     bal = rnd(float(b['total']) - float(b['paid']))
     if amt <= 0: raise ApiError('Enter the amount paid.')
@@ -366,7 +367,7 @@ def doc_state(x: dict) -> str:
     if x.get('due_date') and x['due_date'] < today(): return 'overdue'
     return 'partial' if float(x['paid']) > EPS else 'unpaid'
 
-LINES_SQL = "(SELECT GROUP_CONCAT(COALESCE(i.name,l.description)||' ×'||l.qty, char(10)) FROM sdoc_lines l LEFT JOIN items i ON i.id=l.item_id WHERE l.doc_id=x.id)"
+LINES_SQL = "(SELECT string_agg(COALESCE(i.name,l.description)||' ×'||hic_num(l.qty), chr(10) ORDER BY l.id) FROM sdoc_lines l LEFT JOIN items i ON i.id=l.item_id WHERE l.doc_id=x.id)"
 
 def docs_query(f: dict, limit: int = 3000) -> list:
     w, p = ['1=1'], []
@@ -470,7 +471,7 @@ def doc_refresh(did: int) -> None:
     q("UPDATE sdocs SET paid=?, status=CASE WHEN status='void' THEN 'void' WHEN ?+0.005>=total THEN 'paid' ELSE 'open' END WHERE id=? AND kind IN ('invoice','receipt')", (paid, paid, did))
 
 def cust_pay(did: int, amt: float, date: str, method: str, ref: str, note: str, u: dict, account_id=None) -> int:
-    x = row("SELECT * FROM sdocs WHERE id=? AND kind='invoice'", (did,))
+    x = row("SELECT * FROM sdocs WHERE id=? AND kind='invoice' FOR UPDATE", (did,))
     if not x or x['status'] == 'void': raise ApiError('Invoice not found or void.')
     bal = rnd(float(x['total']) - float(x['paid']))
     if amt <= 0: raise ApiError('Enter the amount received.')
@@ -589,12 +590,12 @@ def act_acc_settings_save(inp):
 # ================================================================ expenses
 def act_expense_cats(inp):
     need_any([('expenses', 'view'), ('expenses', 'add'), ('reports', 'view')])
-    return rows('SELECT c.*,(SELECT COUNT(*) FROM expense_entries e WHERE e.category_id=c.id) used FROM exp_categories c ORDER BY c.active DESC,c.name')
+    return rows('SELECT c.*,(SELECT COUNT(*) FROM expense_entries e WHERE e.category_id=c.id) used FROM exp_categories c ORDER BY c.active DESC,lower(c.name)')
 
 def act_expense_cat_save(inp):
     need('expenses', 'edit'); id_ = I(inp.get('id')); name = s(inp.get('name'), 60)
     if not name: raise ApiError('Category name is required.')
-    if val('SELECT 1 FROM exp_categories WHERE name=? AND id<>?', (name, id_)): raise ApiError('That category already exists.')
+    if val('SELECT 1 FROM exp_categories WHERE lower(name)=lower(?) AND id<>?', (name, id_)): raise ApiError('That category already exists.')
     f = {'name': name, 'active': 0 if inp.get('active') in (False, 0, '0') else 1}
     if id_: upd('exp_categories', id_, f)
     else: id_ = ins('exp_categories', f)
@@ -665,7 +666,7 @@ def acct_flows(aid: int | None = None, to: str | None = None) -> list:
     out = []
     def add(sql, dcol, acol, fmt, sign=1):
         p = ([aid] if aid else []) + ([to] if to else [])
-        for r in rows(sql + (f' AND {acol}=?' if aid else '') + (f' AND {dcol}<=?' if to else ''), p):
+        for r in rows(sql + (f' AND {acol}=?' if aid else '') + (f' AND {dcol}<=?' if to else '') + f" ORDER BY {dcol.split('.')[0]}.id", p):
             out.append({'account_id': r['aid'], 'date': r['d'], 'ts': r.get('ts') or 0, **fmt(r), 'amount': rnd(sign * float(r['amount']))})
     add("SELECT p.account_id aid,p.date d,p.ts,p.amount,p.method,p.ref,x.number,x.kind xk,x.customer_name FROM cust_payments p JOIN sdocs x ON x.id=p.doc_id WHERE p.account_id IS NOT NULL", 'p.date', 'p.account_id',
         lambda r: {'kind': 'Sales receipt' if r['xk'] == 'receipt' else 'Customer payment', 'ref': r['number'], 'desc': f"{r['customer_name']} — {r['method']}" + (f" ({r['ref']})" if r['ref'] else '')})
@@ -709,7 +710,7 @@ def act_account_save(inp):
     f = {'name': s(inp.get('name'), 60), 'type': inp.get('type') if inp.get('type') in ACC_TYPES else 'cash', 'number': s(inp.get('number'), 60), 'notes': s(inp.get('notes'), 300),
          'opening_balance': rnd(n(inp.get('opening_balance'))), 'opening_date': d(inp.get('opening_date')) or today(), 'active': 0 if inp.get('active') in (False, 0, '0') else 1}
     if not f['name']: raise ApiError('Account name is required.')
-    if val('SELECT 1 FROM money_accounts WHERE name=? AND id<>?', (f['name'], id_)): raise ApiError('An account with this name already exists.')
+    if val('SELECT 1 FROM money_accounts WHERE lower(name)=lower(?) AND id<>?', (f['name'], id_)): raise ApiError('An account with this name already exists.')
     if id_: upd('money_accounts', id_, f)
     else: id_ = ins('money_accounts', {**f, 'created_at': now()})
     audit('update' if inp.get('id') else 'create', 'account', id_, f"{f['name']} opening {f['opening_balance']}")
@@ -744,7 +745,7 @@ def act_account_transfer(inp):
     if amt + fee > have + EPS: raise ApiError(f'{na} only has {have:,.2f} — not enough for {amt + fee:,.2f}. (If the account really has more, set its opening balance first.)')
     fee_id = None
     if fee > 0:
-        cat = val("SELECT id FROM exp_categories WHERE name='Bank & mobile money fees'") or ins('exp_categories', {'name': 'Bank & mobile money fees'})
+        cat = val("SELECT id FROM exp_categories WHERE lower(name)='bank & mobile money fees'") or ins('exp_categories', {'name': 'Bank & mobile money fees'})
         fee_id = ins('expense_entries', {'date': date, 'category_id': cat, 'payee': na, 'amount': fee, 'method': 'Other', 'ref': s(inp.get('ref'), 60), 'description': f'Transfer fee {na} → {nb}', 'user_id': u['id'], 'ts': now(), 'account_id': a})
     id_ = ins('acc_transfers', {'date': date, 'from_id': a, 'to_id': b, 'amount': amt, 'fee': fee, 'fee_expense_id': fee_id, 'ref': s(inp.get('ref'), 60), 'note': s(inp.get('note'), 200), 'user_id': u['id'], 'ts': now()})
     audit('transfer', 'account', id_, f'{na} → {nb} {amt}' + (f' (fee {fee})' if fee else ''))

@@ -20,7 +20,7 @@ def soft_kind(k) -> str:
 SOFT_COLS = """j.id,j.kind,j.customer_id,c.name customer_name,c.phone,j.device,j.imei,j.serial,cb.name created_name,(j.gmail_pw IS NOT NULL OR j.apple_pw IS NOT NULL) has_secret,j.problem,j.diagnosis,j.apple_id,j.lock_info,j.technician_id,u.name tech,j.status,j.notes,j.request_date,j.expected_date,j.account_date,j.price,j.discount,j.received_at,j.updated_at,
   COALESCE((SELECT SUM(amount) FROM soft_payments WHERE job_id=j.id),0) paid,
   (SELECT COUNT(*) FROM soft_parts WHERE job_id=j.id) parts_count,
-  CASE WHEN j.expected_date IS NULL THEN NULL ELSE CAST(julianday(j.expected_date)-julianday(date('now','localtime')) AS INTEGER) END days_left"""
+  hic_days_until(j.expected_date) days_left"""
 SOFT_FROM = 'FROM soft_jobs j JOIN customers c ON c.id=j.customer_id LEFT JOIN users u ON u.id=j.technician_id LEFT JOIN users cb ON cb.id=j.created_by'
 
 
