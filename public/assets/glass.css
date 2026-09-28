@@ -1,0 +1,176 @@
+/* =====================================================================
+   HARGEISA IPHONE CENTER — LIQUID GLASS design layer
+   Translucent, blurred surfaces with specular edges, a living colour
+   field behind them, and glossy controls. Follows every theme.
+   Switch off in  Themes / Settings → Liquid Glass  (html[data-glass=off]).
+   ===================================================================== */
+html[data-glass=on]{
+  --g-blur:22px;
+  --g-bg:color-mix(in srgb,var(--panel) 80%,transparent);
+  --g-bg2:color-mix(in srgb,var(--panel2) 86%,transparent);
+  --g-line:rgba(255,255,255,.13);
+  --g-edge:rgba(255,255,255,.26);           /* bright top edge (specular) */
+  --g-sheen:rgba(255,255,255,.06);          /* diagonal light sweep */
+  --g-shadow:0 14px 40px rgba(0,0,0,.30),0 2px 8px rgba(0,0,0,.18);
+  --g-input:color-mix(in srgb,var(--panel2) 78%,transparent);
+  --g-inner:inset 0 2px 7px rgba(0,0,0,.22);
+  background:var(--bg);
+}
+html[data-glass=on][data-theme=light],html[data-glass=on][data-theme=rose],html[data-glass=on][data-theme=ocean]{
+  --g-bg:color-mix(in srgb,#fff 82%,transparent);
+  --g-bg2:color-mix(in srgb,#fff 88%,transparent);
+  --g-line:rgba(255,255,255,.95);
+  --g-edge:rgba(255,255,255,1);
+  --g-sheen:rgba(255,255,255,.35);
+  --g-shadow:0 14px 38px rgba(40,70,130,.16),0 2px 8px rgba(40,70,130,.08);
+  --g-input:rgba(255,255,255,.92);
+  --g-inner:inset 0 1px 4px rgba(30,60,120,.10);
+}
+
+/* ---- living colour field behind the glass */
+html[data-glass=on]::before{
+  content:"";position:fixed;inset:-25%;z-index:-1;pointer-events:none;
+  background:
+    radial-gradient(38% 38% at 14% 18%,color-mix(in srgb,var(--primary) 34%,transparent),transparent 70%),
+    radial-gradient(34% 34% at 86% 12%,color-mix(in srgb,var(--accent) 28%,transparent),transparent 70%),
+    radial-gradient(44% 44% at 72% 92%,color-mix(in srgb,var(--c3) 26%,transparent),transparent 70%),
+    radial-gradient(30% 30% at 8% 88%,color-mix(in srgb,var(--c6) 20%,transparent),transparent 70%);
+  filter:blur(28px) saturate(140%);
+  animation:g-drift 32s ease-in-out infinite alternate;
+}
+html[data-glass=on][data-theme=light]::before,html[data-glass=on][data-theme=rose]::before,html[data-glass=on][data-theme=ocean]::before{opacity:.55}
+@keyframes g-drift{0%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(3%,-2%,0) scale(1.06)}100%{transform:translate3d(-3%,3%,0) scale(1.02)}}
+html[data-glass=on] body{background:transparent}
+
+/* ---- the glass surface */
+html[data-glass=on] :is(.card,.side,.top,.modal,.pop,.tablewrap,.gres,.toast,.lcard,.theme){
+  background:linear-gradient(135deg,var(--g-sheen),transparent 46%),var(--g-bg);
+  -webkit-backdrop-filter:blur(var(--g-blur)) saturate(185%);
+  backdrop-filter:blur(var(--g-blur)) saturate(185%);
+  border:1px solid var(--g-line);
+  box-shadow:inset 0 1px 0 var(--g-edge),inset 0 -1px 0 rgba(255,255,255,.05),inset 1px 0 0 rgba(255,255,255,.06),var(--g-shadow);
+}
+html[data-glass=on] .side{border-width:0 1px 0 0;border-radius:0;box-shadow:inset -1px 0 0 var(--g-line),12px 0 40px rgba(0,0,0,.18)}
+html[data-glass=on] .top{border-width:0 0 1px 0;border-radius:0;background:linear-gradient(180deg,var(--g-sheen),transparent),color-mix(in srgb,var(--panel) 84%,transparent);box-shadow:inset 0 -1px 0 var(--g-line),0 8px 30px rgba(0,0,0,.14)}
+html[data-glass=on] .card{border-radius:20px}
+html[data-glass=on] .modal{border-radius:26px;box-shadow:inset 0 1px 0 var(--g-edge),0 30px 90px rgba(0,0,0,.45),0 4px 16px rgba(0,0,0,.25)}
+html[data-glass=on] .pop{border-radius:18px}
+html[data-glass=on] .theme{border-radius:18px}
+html[data-glass=on] .toast{border-left-width:4px}
+/* nested glass is flat (cheaper, cleaner) */
+html[data-glass=on] :is(.modal .card,.card .card,.card .tablewrap,.modal .tablewrap,.pop .card){-webkit-backdrop-filter:none;backdrop-filter:none;background:var(--g-bg2);box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+html[data-glass=on] .ov{background:rgba(8,12,28,.5);-webkit-backdrop-filter:blur(12px) saturate(150%);backdrop-filter:blur(12px) saturate(150%)}
+html[data-glass=on][data-theme=light] .ov,html[data-glass=on][data-theme=rose] .ov,html[data-glass=on][data-theme=ocean] .ov{background:rgba(210,224,246,.55)}
+html[data-glass=on] .modal-h,html[data-glass=on] .modal-f{border-color:var(--g-line)}
+html[data-glass=on] .pop-h{border-color:var(--g-line)}
+
+/* ---- statistic tiles: glossy icon "gems" */
+html[data-glass=on] .stat .si{background:linear-gradient(160deg,color-mix(in srgb,var(--c) 92%,#fff),var(--c) 55%,color-mix(in srgb,var(--c) 78%,#000));box-shadow:inset 0 1px 0 rgba(255,255,255,.55),inset 0 -3px 6px rgba(0,0,0,.18),0 10px 22px color-mix(in srgb,var(--c) 45%,transparent)}
+html[data-glass=on] .stat::after{opacity:.16;filter:blur(6px)}
+html[data-glass=on] .card:hover{box-shadow:inset 0 1px 0 var(--g-edge),inset 0 -1px 0 rgba(255,255,255,.05),0 18px 50px rgba(0,0,0,.34),0 2px 8px rgba(0,0,0,.18);transition:box-shadow .25s}
+
+/* ---- navigation */
+html[data-glass=on] .nav a{border-radius:14px;transition:background .2s,color .2s,transform .15s}
+html[data-glass=on] .nav a:hover{background:rgba(255,255,255,.09);transform:translateX(2px)}
+html[data-glass=on] .nav a.on{background:linear-gradient(135deg,color-mix(in srgb,var(--primary) 82%,transparent),color-mix(in srgb,var(--accent) 66%,transparent));-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5),inset 0 -1px 0 rgba(0,0,0,.12),0 10px 28px color-mix(in srgb,var(--primary) 45%,transparent)}
+html[data-glass=on] .nav a.on::before{display:none}
+html[data-glass=on] .nav .sep{background:var(--g-line)}
+html[data-glass=on] .brand img,html[data-glass=on] .auth-l img{box-shadow:inset 0 1px 0 rgba(255,255,255,.4),0 8px 22px rgba(0,0,0,.25)}
+
+/* ---- controls */
+html[data-glass=on] :is(.icon-btn,.avatar){box-shadow:inset 0 1px 0 var(--g-edge),0 6px 16px rgba(0,0,0,.2)}
+html[data-glass=on] .icon-btn{background:linear-gradient(180deg,var(--g-sheen),transparent),var(--g-bg2);-webkit-backdrop-filter:blur(12px) saturate(170%);backdrop-filter:blur(12px) saturate(170%);border-color:var(--g-line)}
+html[data-glass=on] .me:hover{background:rgba(255,255,255,.08);border-color:var(--g-line)}
+html[data-glass=on] .btn{
+  background:linear-gradient(180deg,rgba(255,255,255,.20),rgba(255,255,255,.03) 60%),var(--g-bg2);
+  -webkit-backdrop-filter:blur(12px) saturate(170%);backdrop-filter:blur(12px) saturate(170%);
+  border:1px solid var(--g-line);border-radius:14px;
+  box-shadow:inset 0 1px 0 var(--g-edge),0 4px 12px rgba(0,0,0,.14);transition:transform .15s,box-shadow .2s,border-color .2s,filter .2s}
+html[data-glass=on] .btn:hover{transform:translateY(-1px);filter:brightness(1.08);box-shadow:inset 0 1px 0 var(--g-edge),0 8px 20px rgba(0,0,0,.2)}
+html[data-glass=on] .btn:active{transform:translateY(0) scale(.98)}
+html[data-glass=on] .btn.ghost{background:transparent;box-shadow:none}
+html[data-glass=on] .btn.primary{background:linear-gradient(180deg,rgba(255,255,255,.42),rgba(255,255,255,0) 58%),var(--grad);border-color:rgba(255,255,255,.35);box-shadow:inset 0 1px 0 rgba(255,255,255,.65),inset 0 -2px 4px rgba(0,0,0,.14),0 10px 26px color-mix(in srgb,var(--primary) 46%,transparent)}
+html[data-glass=on] .btn.danger{background:linear-gradient(180deg,rgba(255,255,255,.34),rgba(255,255,255,0) 58%),var(--danger);border-color:rgba(255,255,255,.3);box-shadow:inset 0 1px 0 rgba(255,255,255,.55),0 8px 22px color-mix(in srgb,var(--danger) 42%,transparent)}
+html[data-glass=on] .btn.warn{background:linear-gradient(180deg,rgba(255,255,255,.34),rgba(255,255,255,0) 58%),#f97316;border-color:rgba(255,255,255,.3);box-shadow:inset 0 1px 0 rgba(255,255,255,.55),0 8px 22px rgba(249,115,22,.4)}
+html[data-glass=on] .btn.ok{background:linear-gradient(180deg,rgba(255,255,255,.34),rgba(255,255,255,0) 58%),var(--ok);border-color:rgba(255,255,255,.3);box-shadow:inset 0 1px 0 rgba(255,255,255,.55),0 8px 22px rgba(34,197,94,.38)}
+html[data-glass=on] .btn:disabled{filter:grayscale(.3)}
+html[data-glass=on] :is(input,select,textarea){background:var(--g-input);border:1px solid var(--g-line);border-radius:13px;box-shadow:var(--g-inner);transition:box-shadow .2s,border-color .2s,background .2s}
+html[data-glass=on] :is(input,select,textarea):focus{border-color:color-mix(in srgb,var(--primary) 70%,#fff);box-shadow:var(--g-inner),0 0 0 4px color-mix(in srgb,var(--primary) 28%,transparent),0 0 24px color-mix(in srgb,var(--primary) 30%,transparent)}
+html[data-glass=on] :is(input,select,textarea):disabled{opacity:.6}
+html[data-glass=on] select option{background:var(--panel);color:var(--text)}
+html[data-glass=on] input[type=checkbox]{box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none}
+html[data-glass=on] .chip{-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);box-shadow:inset 0 1px 0 rgba(255,255,255,.28)}
+html[data-glass=on] .tabs{border-color:var(--g-line)}
+html[data-glass=on] .tabs a.on{text-shadow:0 0 18px color-mix(in srgb,var(--primary) 60%,transparent)}
+
+/* ---- tables */
+html[data-glass=on] .tbl th{background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.02)),var(--g-bg2);border-color:var(--g-line)}
+html[data-glass=on] .tbl td{border-color:rgba(255,255,255,.08)}
+html[data-glass=on][data-theme=light] .tbl td,html[data-glass=on][data-theme=rose] .tbl td,html[data-glass=on][data-theme=ocean] .tbl td{border-color:rgba(60,90,150,.10)}
+html[data-glass=on] .tbl tbody tr{transition:background .15s}
+html[data-glass=on] .tbl tbody tr:hover{background:rgba(255,255,255,.10)}
+html[data-glass=on] .pager select{background:var(--g-input)}
+html[data-glass=on] .kv dd,html[data-glass=on] .card h3{text-shadow:none}
+
+/* ---- notifications, search, dashboards */
+html[data-glass=on] .nt:hover,html[data-glass=on] .pop a.mi:hover,html[data-glass=on] .gres a:hover,html[data-glass=on] .tm:hover{background:rgba(255,255,255,.10)}
+html[data-glass=on] .nt.unread{background:linear-gradient(90deg,color-mix(in srgb,var(--primary) 16%,transparent),transparent)}
+html[data-glass=on] .badge{box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 4px 10px rgba(239,68,68,.5)}
+html[data-glass=on] .notice{-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-radius:14px}
+html[data-glass=on] .hb .t{background:rgba(255,255,255,.08);box-shadow:inset 0 2px 5px rgba(0,0,0,.28)}
+html[data-glass=on] .step i{background:var(--g-bg2);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+html[data-glass=on] .foot{background:transparent;border-color:var(--g-line)}
+html[data-glass=on] .skeleton{background:linear-gradient(90deg,rgba(255,255,255,.05),rgba(255,255,255,.16),rgba(255,255,255,.05));background-size:200% 100%}
+
+/* ---- login: glass card floating over the colour field */
+html[data-glass=on] .auth2{background:transparent}
+html[data-glass=on] .lpanel{background:transparent}
+html[data-glass=on] .lcard{border-radius:30px;padding:34px 32px;box-shadow:inset 0 1px 0 var(--g-edge),0 30px 80px rgba(0,0,0,.35),0 4px 14px rgba(0,0,0,.2)}
+html[data-glass=on] .lsw{background:var(--g-input);box-shadow:var(--g-inner);border:1px solid var(--g-line)}
+html[data-glass=on] .lsw a.on{background:linear-gradient(180deg,rgba(255,255,255,.3),rgba(255,255,255,.08)),var(--g-bg);box-shadow:inset 0 1px 0 var(--g-edge),0 4px 12px rgba(0,0,0,.2)}
+html[data-glass=on] .lcard .ifield input{background:var(--g-input)}
+html[data-glass=on] .hero{box-shadow:inset -1px 0 0 rgba(255,255,255,.2)}
+html[data-glass=on] .hero .logo{-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 20px 44px rgba(0,0,0,.3)}
+html[data-glass=on] .feat li i{-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);box-shadow:inset 0 1px 0 rgba(255,255,255,.45);background:rgba(255,255,255,.18)}
+html[data-glass=on] .auth-l{background:transparent}
+html[data-glass=on] .auth{background:transparent}
+
+/* ---- scrollbars */
+html[data-glass=on] *{scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.28) transparent}
+html[data-glass=on] ::-webkit-scrollbar{width:10px;height:10px}
+html[data-glass=on] ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.26);border-radius:99px;border:2px solid transparent;background-clip:content-box}
+
+/* ---- phones: keep glass, drop the expensive nested blur */
+@media(max-width:700px){
+  html[data-glass=on]{--g-blur:16px}
+  html[data-glass=on] .tbl tr{background:linear-gradient(135deg,var(--g-sheen),transparent 50%),var(--g-bg2);border-color:var(--g-line);box-shadow:inset 0 1px 0 var(--g-edge),var(--g-shadow);-webkit-backdrop-filter:none;backdrop-filter:none}
+  html[data-glass=on] .tablewrap{background:transparent;border:0;box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none}
+  html[data-glass=on] .modal{border-radius:0}
+  html[data-glass=on] .lcard{padding:26px 20px;border-radius:26px}
+}
+/* ---- fall-backs: browsers without backdrop-filter, or users who asked for less transparency */
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+  html[data-glass=on] :is(.card,.side,.top,.modal,.pop,.tablewrap,.gres,.toast,.lcard,.theme,.btn,.icon-btn){background:var(--panel)}
+}
+@media (prefers-reduced-transparency:reduce){
+  html[data-glass=on] :is(.card,.side,.top,.modal,.pop,.tablewrap,.gres,.toast,.lcard,.theme){background:var(--panel);-webkit-backdrop-filter:none;backdrop-filter:none}
+  html[data-glass=on]::before{display:none}
+}
+@media (prefers-reduced-motion:reduce){html[data-glass=on]::before{animation:none}}
+@media print{html[data-glass=on]::before{display:none}html[data-glass=on] *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important;box-shadow:none!important}}
+
+/* readability: modals, menus and tables are near-solid so text never fights the background */
+html[data-glass=on] :is(.modal,.pop,.gres){background:linear-gradient(135deg,var(--g-sheen),transparent 46%),color-mix(in srgb,var(--panel) 94%,transparent)}
+html[data-glass=on] .side{background:linear-gradient(135deg,var(--g-sheen),transparent 46%),color-mix(in srgb,var(--side) 88%,transparent)}
+html[data-glass=on] .tbl th{background:var(--panel2)}
+html[data-glass=on] .tablewrap{background:color-mix(in srgb,var(--panel) 90%,transparent)}
+
+/* Dark / White system themes stay solid and clean */
+html[data-glass=on][data-theme=dark]::before,html[data-glass=on][data-theme=white]::before{display:none}
+html[data-glass=on][data-theme=dark],html[data-glass=on][data-theme=white]{--g-bg:var(--panel);--g-bg2:var(--panel2);--g-sheen:transparent;--g-input:var(--panel2)}
+html[data-glass=on][data-theme=white]{--g-line:var(--border);--g-edge:transparent;--g-shadow:0 4px 16px rgba(0,0,0,.07);--g-inner:none}
+html[data-glass=on][data-theme=dark]{--g-line:var(--border);--g-edge:rgba(255,255,255,.05)}
+html[data-glass=on][data-theme=dark] :is(.card,.side,.top,.modal,.pop,.tablewrap,.gres,.toast,.lcard,.theme),html[data-glass=on][data-theme=white] :is(.card,.side,.top,.modal,.pop,.tablewrap,.gres,.toast,.lcard,.theme){background:var(--panel);-webkit-backdrop-filter:none;backdrop-filter:none}
+html[data-glass=on][data-theme=white] .btn:not(.primary):not(.danger):not(.warn):not(.ok){background:#fff}
+html[data-glass=on][data-theme=white] .nav a:hover{background:rgba(0,0,0,.05)}
