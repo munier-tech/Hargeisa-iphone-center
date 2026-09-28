@@ -42,6 +42,21 @@ Dates in SQL use Hargeisa time (UTC+3) everywhere. Neon suspends an idle databas
 a second or two. Host the server close to the Neon region (or choose a Neon region close to the server) — every page makes several queries.
 
 
+## Deploy on Vercel
+The same code runs on Vercel (`vercel.json` + the root `app.py`). In the Vercel project → Settings → Environment Variables add:
+- `DATABASE_URL` — the Neon connection string (the `-pooler` one).
+- `HIC_APP_KEY` — the 64 characters inside `data\app.key` (decrypts the saved Apple ID passwords; without it the server refuses to
+  encrypt/decrypt rather than silently making a new key).
+
+What is different on Vercel (automatic — `VERCEL` is set by Vercel):
+- Chat attachments are stored in the database (table `chat_files`; older files from `data\chat_files` are copied in once). Largest
+  attachment is 3 MB, because Vercel refuses requests over 4.5 MB.
+- Backups are stored in the database (table `backup_files`) instead of `data\backups`, and are listed, verified, downloaded and restored
+  the same way. The daily automatic backup is taken by the heartbeat (there is no background thread on Vercel).
+- The function runs in `cle1` (Cleveland, the same area as Neon `us-east-2`) — change `regions` in `vercel.json` if your Neon region is different.
+- `.vercelignore` keeps `data\hic.sqlite`, `data\backups`, `legacy_php` and `.env` out of the upload.
+Set `HIC_BACKUP_STORE=db` to use the database backup store on a normal server too.
+
 ## Layout
 - `server/` — Python backend: `app.py` (web server + API dispatcher), `core.py` (database, sessions, security, finance totals),
   `acc.py` (items & stock, stores & bills, quotations & invoices, payments, expenses), `h_reports.py` (all reports),

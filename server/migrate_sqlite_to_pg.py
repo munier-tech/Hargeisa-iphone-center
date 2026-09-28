@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import core, pgsync
 from flask import Flask, g
 
-SEED_ONLY = {'settings', 'users', 'items', 'exp_categories', 'activity', 'notifications', 'login_attempts', 'sessions', 'backups'}   # what a brand-new, never-used database contains
+SEED_ONLY = {'settings', 'users', 'items', 'exp_categories', 'activity', 'notifications', 'login_attempts', 'sessions', 'backups', 'backup_files', 'chat_files'}   # what a brand-new, never-used database contains
 
 
 def main() -> int:
@@ -64,7 +64,6 @@ def main() -> int:
                         print('Nothing was changed. Run again with --replace to overwrite it with the SQLite data.'); return 1
                     t0 = time.time(); print('\nCopying tables:')
                     copied = pgsync.sqlite_to_pg(snap, c, log=print)
-                    core.migrate()                                    # no-op for an up-to-date database (all upgrade flags are already set)
                     mismatch, skipped = [], []
                     for t, n in src_counts.items():
                         if t in copied:
@@ -73,6 +72,7 @@ def main() -> int:
                         elif n: skipped.append(f'{t}: {n} row(s) — table is not used by the current system, not copied')
                     if mismatch:
                         core.q('ROLLBACK'); print('\nRow counts do not match - nothing was committed:\n  ' + '\n  '.join(mismatch)); return 1
+                    core.migrate()                                    # after the check: upgrades the copied data to this version (e.g. chat files into the database)
                     core.q('COMMIT')
                 except BaseException:
                     if core.in_tx(): core.q('ROLLBACK')
