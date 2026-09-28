@@ -1,2 +1,9 @@
-# local secrets: the PostgreSQL / Neon connection string lives here, never in the repository
+# Local secrets and database files must never be committed.
 .env
+.env.*
+!.env.example
+data/app.key
+data/hic.sqlite*
+data/backups/
+data/chat_files/
+data/tmp/

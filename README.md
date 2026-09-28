@@ -14,9 +14,10 @@ from `data\hic.sqlite` to PostgreSQL (the SQLite file is kept untouched as an ar
 5. Default login on a brand-new, empty database: `admin@hic.so` / `Admin@123` → change it in **My Profile** straight away.
 
 First-time setup on a new PC: `winget install -e --id Python.Python.3.12`, then run START-SYSTEM.bat.
-Environment variables: `DATABASE_URL` (**required** — the PostgreSQL / Neon connection string), `HIC_HOST` (default `0.0.0.0`; use `127.0.0.1`
-for this-PC-only), `HIC_PORT` (default `8080`), `HIC_DATA_DIR` (folder for `app.key`, backups and chat files; default `data`), `HIC_DB_POOL`
-(database connections kept open, default 12).
+Environment variables: `DATABASE_URL` (**required** — the PostgreSQL / Neon connection string), `HIC_ENCRYPTION_KEY` (optional locally; 64 hex
+characters for existing encrypted Apple ID passwords), `HIC_HOST` (default `0.0.0.0`; use `127.0.0.1` for this-PC-only), `HIC_PORT` (default
+`8080`), `HIC_DATA_DIR` (local folder for `app.key`, backups and legacy chat files; default `data`), and `HIC_DB_POOL` (default 12 locally,
+2 per Vercel function instance to allow a request and a backup operation to borrow connections concurrently).
 
 ## Database: PostgreSQL (Neon)
 The connection string is **never** stored in the source code. The server reads it from the `DATABASE_URL` environment variable, or —
@@ -37,25 +38,32 @@ nothing else to install on Windows) and `psycopg-pool` (keeps connections to Neo
    If PostgreSQL already holds business data it stops; add `--replace` to overwrite it. `--sqlite PATH` imports another file.
 5. Start the server with START-SYSTEM.bat and sign in with your usual account.
 
-Notes: `data\app.key` still decrypts the Apple ID passwords, and chat attachments stay in `data\chat_files` — keep both.
+Notes: `data\app.key` decrypts existing Apple ID passwords, and legacy chat attachments may still be in `data\chat_files` — keep both locally.
+On Vercel, use `HIC_ENCRYPTION_KEY` and PostgreSQL-backed chat attachments instead of relying on the deployment filesystem.
 Dates in SQL use Hargeisa time (UTC+3) everywhere. Neon suspends an idle database after a few minutes; the first request after that takes
 a second or two. Host the server close to the Neon region (or choose a Neon region close to the server) — every page makes several queries.
 
 
 ## Deploy on Vercel
-The same code runs on Vercel (`vercel.json` + the root `app.py`). In the Vercel project → Settings → Environment Variables add:
-- `DATABASE_URL` — the Neon connection string (the `-pooler` one).
-- `HIC_APP_KEY` — the 64 characters inside `data\app.key` (decrypts the saved Apple ID passwords; without it the server refuses to
-  encrypt/decrypt rather than silently making a new key).
+The same-origin frontend and Flask API run from the Python function configured in `vercel.json`. In Vercel → Project → Settings → Environment
+Variables, add these for **Production**, and also Preview/Development if those environments will be used:
+- `DATABASE_URL` — Neon Console → your project → Connect → select the pooled connection string. Keep `sslmode=require`; never put the value in source control.
+- `HIC_ENCRYPTION_KEY` — the 64 hexadecimal characters from the existing local `data\app.key`. This must be the same key to decrypt existing Apple ID passwords. The key file itself is excluded from Vercel and Git.
+
+No `FLASK_SECRET_KEY` is required: authentication uses random, revocable sessions stored in PostgreSQL rather than Flask's client-side sessions.
+No `CORS_ORIGIN` is required: the browser app and API are same-origin, and the server does not enable cross-origin access. Do not add wildcard CORS.
+The session cookies are HttpOnly, SameSite=Lax, and Secure on Vercel HTTPS.
 
 What is different on Vercel (automatic — `VERCEL` is set by Vercel):
 - Chat attachments are stored in the database (table `chat_files`; older files from `data\chat_files` are copied in once). Largest
   attachment is 3 MB, because Vercel refuses requests over 4.5 MB.
 - Backups are stored in the database (table `backup_files`) instead of `data\backups`, and are listed, verified, downloaded and restored
-  the same way. The daily automatic backup is taken by the heartbeat (there is no background thread on Vercel).
+  the same way. Staging files use `/tmp` only. Automatic backup checks run on authenticated app heartbeats; Vercel has no background worker, so this is not a guaranteed wall-clock schedule. Keep Neon point-in-time recovery enabled. Large backup downloads/restores remain subject to Vercel function size and duration limits; use object storage such as S3 or Cloudflare R2 if backups approach those limits.
 - The function runs in `cle1` (Cleveland, the same area as Neon `us-east-2`) — change `regions` in `vercel.json` if your Neon region is different.
-- `.vercelignore` keeps `data\hic.sqlite`, `data\backups`, `legacy_php` and `.env` out of the upload.
-Set `HIC_BACKUP_STORE=db` to use the database backup store on a normal server too.
+- `.vercelignore` keeps the local SQLite database, encryption key, backups, `legacy_php` and `.env` out of the deployment bundle. SQLite is not used by the production request path.
+- Database initialization runs on the first database-backed request, not while Vercel imports the WSGI module. Each function instance defaults to a two-connection pool; keep Neon’s pooled (`-pooler`) URL in `DATABASE_URL`.
+
+The original `data\hic.sqlite` remains local and is not modified. Its contents are not needed by Vercel because production data is in Neon.
 
 ## Layout
 - `server/` — Python backend: `app.py` (web server + API dispatcher), `core.py` (database, sessions, security, finance totals),

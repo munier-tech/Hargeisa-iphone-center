@@ -95,7 +95,7 @@ def auto_backup_loop() -> None:
             with core.pool().connection() as c:
                 on = _get(c, 'bk_auto', 'on') != 'off'; last = cq(c, "SELECT MAX(ts) t FROM backups WHERE kind='auto'").fetchone()['t'] or 0
             if on and now() - int(last) >= 24 * 3600: make_backup('auto', None, 'Scheduled automatic backup')
-        except Exception as e: core.ERRLOG.append({'ts': now(), 'where': 'auto-backup', 'msg': str(e)})
+        except Exception as e: core.ERRLOG.append({'ts': now(), 'where': 'auto-backup', 'msg': core.redact_secrets(str(e))[:300]})
         time.sleep(1800)
 
 def auto_backup_if_due() -> None:
@@ -259,7 +259,7 @@ def act_health(inp):
     try:
         t0 = time.time(); ver = str(val("SELECT current_setting('server_version')")); ms = (time.time() - t0) * 1000
         add('Database connection', 'ok' if ms < 500 else 'warn', f'PostgreSQL {ver} reachable — {ms:.0f} ms per query')
-    except Exception as e: add('Database connection', 'crit', str(e))
+    except Exception as e: add('Database connection', 'crit', core.redact_secrets(str(e)))
     tables = [(t['name'], int(val(f'SELECT COUNT(*) FROM "{t["name"]}"'))) for t in rows(LIVE_TABLES_SQL)]
     dbsize = db_size()
     add('Database size', 'ok' if dbsize < 2e9 else 'warn', f'{dbsize / 1e6:.1f} MB')

@@ -18,8 +18,10 @@ from flask import g, request, has_request_context
 import collections
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ON_VERCEL = bool(os.environ.get('VERCEL'))
 DATA = os.path.abspath(os.environ.get('HIC_DATA_DIR', os.path.join(ROOT, 'data')))
-os.makedirs(DATA, exist_ok=True)
+if not ON_VERCEL:
+    os.makedirs(DATA, exist_ok=True)
 TZ = timezone(timedelta(hours=3))            # Africa/Mogadishu (no daylight saving)
 PG_TZ = "INTERVAL '+03:00'"                # the same fixed offset, for SQL (needs no time-zone database on the server)
 
@@ -40,9 +42,16 @@ _load_env_file()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 # Serverless hosting (Vercel): the disk is read-only (only a temporary /tmp that is wiped), and nothing runs between requests.
 # There, chat attachments and backups are kept inside PostgreSQL, and the daily automatic backup runs from the heartbeat.
-ON_VERCEL = bool(os.environ.get('VERCEL'))
 BACKUPS_IN_DB = ON_VERCEL or os.environ.get('HIC_BACKUP_STORE', '').lower() == 'db'
 TMP = os.environ.get('HIC_TMP') or os.path.join('/tmp' if ON_VERCEL else DATA, 'tmp')    # scratch space for backup files
+
+
+def redact_secrets(text: str) -> str:
+    for name, value in os.environ.items():
+        if value and re.search(r'PASSWORD|SECRET|TOKEN|DATABASE_URL|(?:API|ENCRYPTION|FLASK|HIC)_KEY', name, re.I):
+            text = text.replace(value, '[REDACTED]')
+    text = re.sub(r'(?i)(postgres(?:ql)?://[^:/@\s]+:)[^@\s]+(@)', r'\1[REDACTED]\2', text)
+    return re.sub(r'(?i)\b(password|passwd|secret|token|api[_-]?key)(\s*[=:]\s*)([^\s,;]+)', r'\1\2[REDACTED]', text)
 
 
 class ApiError(Exception):
@@ -139,8 +148,10 @@ def pool() -> ConnectionPool:
     global _pool
     with _pool_lock:
         if _pool is None:
-            _pool = ConnectionPool(db_url(), min_size=1, max_size=max(2, int(os.environ.get('HIC_DB_POOL', '4' if ON_VERCEL else '12'))), name='hic', open=True, timeout=30, max_idle=240,
-                                   kwargs={'autocommit': True, 'row_factory': dict_row, 'prepare_threshold': None, 'connect_timeout': 20},
+            max_size = max(2 if ON_VERCEL else 1, int(os.environ.get('HIC_DB_POOL', '2' if ON_VERCEL else '12')))
+            _pool = ConnectionPool(db_url(), min_size=0 if ON_VERCEL else 1, max_size=max_size, name='hic', open=True,
+                                   timeout=10 if ON_VERCEL else 30, max_idle=60 if ON_VERCEL else 240,
+                                   kwargs={'autocommit': True, 'row_factory': dict_row, 'prepare_threshold': None, 'connect_timeout': 8 if ON_VERCEL else 20},
                                    check=ConnectionPool.check_connection)          # a connection closed by Neon while idle is replaced transparently
     return _pool
 
@@ -412,20 +423,24 @@ ERRLOG: collections.deque = collections.deque(maxlen=30)
 
 _KEY: list = []
 def appkey() -> bytes:
-    """The Apple ID encryption key: HIC_APP_KEY environment variable (64 hex characters), else data/app.key.
+    """The Apple ID encryption key: HIC_ENCRYPTION_KEY (or legacy HIC_APP_KEY), else data/app.key locally.
     A new key is only ever created on a normal server — on serverless hosting a missing key is an error, because a key made
     there would be lost and every password saved with it could never be read again."""
     if _KEY: return _KEY[0]
-    k = os.environ.get('HIC_APP_KEY', '').strip()
+    k = (os.environ.get('HIC_ENCRYPTION_KEY') or os.environ.get('HIC_APP_KEY') or '').strip()
     if not k:
         f = os.path.join(DATA, 'app.key')
         if not os.path.exists(f):
-            if ON_VERCEL: raise RuntimeError('The encryption key is missing: set HIC_APP_KEY (the 64 characters in data/app.key) in the Vercel project settings.')
+            if ON_VERCEL: raise RuntimeError('The encryption key is missing; configure HIC_ENCRYPTION_KEY in the Vercel project settings.')
             with open(f, 'w') as fh: fh.write(secrets.token_hex(32))
         with open(f) as fh: k = fh.read().strip()
-    _KEY.append(bytes.fromhex(k)); return _KEY[0]
+    try: key = bytes.fromhex(k)
+    except ValueError as e: raise RuntimeError('The encryption key must be 64 hexadecimal characters.') from e
+    if len(key) != 32: raise RuntimeError('The encryption key must be 64 hexadecimal characters.')
+    _KEY.append(key); return key
 
 def appkey_source() -> str:
+    if os.environ.get('HIC_ENCRYPTION_KEY', '').strip(): return 'HIC_ENCRYPTION_KEY'
     if os.environ.get('HIC_APP_KEY', '').strip(): return 'HIC_APP_KEY'
     return 'app.key' if os.path.exists(os.path.join(DATA, 'app.key')) else 'missing'
 
@@ -692,7 +707,7 @@ def run_checks() -> None:
     if ON_VERCEL:                   # no background thread on serverless hosting: the heartbeat takes the daily automatic backup
         try:
             import h_center; h_center.auto_backup_if_due()
-        except Exception as e: ERRLOG.append({'ts': now(), 'where': 'auto-backup', 'msg': str(e)[:300]})
+        except Exception as e: ERRLOG.append({'ts': now(), 'where': 'auto-backup', 'msg': redact_secrets(str(e))[:300]})
 
 
 def last_backup_ts() -> int:

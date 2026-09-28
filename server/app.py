@@ -11,6 +11,7 @@ import logging, os, re, sys, threading, traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flask import Flask, g, make_response, request, send_from_directory
+from werkzeug.exceptions import HTTPException
 import json
 
 import core
@@ -51,6 +52,33 @@ def _finish(resp, code_headers=True):
     return resp
 
 
+def _safe_traceback() -> str:
+    return core.redact_secrets(traceback.format_exc())
+
+
+def _log_failure(where: str) -> None:
+    detail = _safe_traceback()
+    log.error('%s\n%s', where, detail)
+    core.ERRLOG.append({'ts': core.now(), 'where': where[:80], 'msg': detail.strip().splitlines()[-1][:300]})
+
+
+@app.before_request
+def _initialize_database_routes():
+    if request.path != '/api.php' and not request.path.startswith(('/chat_file/', '/backup_download/')):
+        return None
+    try:
+        initialize()
+    except Exception:
+        _log_failure('Database initialization')
+        core.STATS['err'] += 1
+        if request.path == '/api.php':
+            resp = make_response(json.dumps({'ok': False, 'error': 'Service temporarily unavailable.'}), 503)
+            resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+            return _finish(resp)
+        return make_response('Service temporarily unavailable.', 503)
+    return None
+
+
 @app.route('/api.php', methods=['GET', 'POST'])
 def api():
     action = re.sub(r'[^a-z_]', '', request.args.get('a', ''))
@@ -73,8 +101,8 @@ def api():
         body = {'ok': False, 'error': e.message, 'now': now(), **e.extra}; code = e.code if 400 <= e.code < 600 else 400
     except Exception:
         _rollback(in_tx)
-        log.error('API error in %s\n%s', action, traceback.format_exc())
-        core.STATS['err'] += 1; core.ERRLOG.append({'ts': core.now(), 'where': action, 'msg': traceback.format_exc().strip().splitlines()[-1][:300]})
+        _log_failure(f'API error in {action}')
+        core.STATS['err'] += 1
         body = {'ok': False, 'error': 'Server error. Please try again.', 'now': now()}; code = 500
     resp = make_response(json.dumps(body, ensure_ascii=False, default=str), code)
     resp.headers['Content-Type'] = 'application/json; charset=utf-8'
@@ -127,6 +155,18 @@ def nf(_): return _page('restricted.html', 404)
 
 @app.errorhandler(405)
 def na(_): return _page('restricted.html', 404)
+
+
+@app.errorhandler(Exception)
+def unhandled_error(error):
+    if isinstance(error, HTTPException): return error
+    _log_failure('Unhandled request error')
+    core.STATS['err'] += 1
+    if request.path == '/api.php':
+        resp = make_response(json.dumps({'ok': False, 'error': 'Server error. Please try again.'}), 500)
+        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+        return _finish(resp)
+    return make_response('Server error. Please try again.', 500)
 
 
 def initialize():
