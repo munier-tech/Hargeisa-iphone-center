@@ -6,7 +6,7 @@ front end, the database and every saved record work unchanged.
     python server/app.py            ->  http://localhost:8080
 """
 from __future__ import annotations
-import logging, os, re, sys, traceback
+import logging, os, re, sys, threading, traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -23,6 +23,8 @@ PUBLIC = os.path.join(ROOT, 'public')
 app = Flask(__name__, static_folder=None)
 app.config['JSON_AS_ASCII'] = False
 log = logging.getLogger('hic')
+_startup_lock = threading.Lock()
+_started = False
 
 # every `act_<name>` function in the handler modules is an API action
 ACTIONS = {}
@@ -126,11 +128,18 @@ def nf(_): return _page('restricted.html', 404)
 def na(_): return _page('restricted.html', 404)
 
 
+def initialize():
+    global _started
+    with _startup_lock:
+        if _started: return
+        core.init_db()
+        threading.Thread(target=h_center.auto_backup_loop, name='auto-backup', daemon=True).start()
+        _started = True
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    core.init_db()
-    import threading
-    threading.Thread(target=h_center.auto_backup_loop, name='auto-backup', daemon=True).start()
+    initialize()
     host = os.environ.get('HIC_HOST', '0.0.0.0'); port = int(os.environ.get('HIC_PORT', '8080'))
     try:
         from waitress import serve
