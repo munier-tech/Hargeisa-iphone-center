@@ -132,6 +132,8 @@ def backup_download(name): return h_center.download_backup(name)
 
 # ------------------------------------------------------------------ static pages
 def _page(name: str, status: int = 200):
+    if not os.path.isfile(os.path.join(PUBLIC, name)):
+        return make_response('Page not found.', 404)
     resp = make_response(send_from_directory(PUBLIC, name)); resp.status_code = status
     resp.headers['Cache-Control'] = 'no-cache'; return resp
 
